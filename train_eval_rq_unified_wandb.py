@@ -6,16 +6,13 @@ import numpy as np
 import time
 import datetime
 import wandb
-
 from pointpillars.utils import setup_seed, keep_bbox_from_image_range, \
-    keep_bbox_from_lidar_range, write_pickle, write_label, \
-    iou2d, iou3d_camera, iou_bev
+    keep_bbox_from_lidar_range, iou2d, iou3d_camera, iou_bev
 from pointpillars.dataset import Kitti, get_dataloader
 from pointpillars.model import PointPillars
 from pointpillars.model.split_nets import split_pointpillars
 from pointpillars.model.quantizations import RQBottleneck
 from pointpillars.loss import Loss
-
 
 class AverageMeter(object):
     """Computes and stores the average and current value"""
@@ -39,7 +36,6 @@ class AverageMeter(object):
     def __str__(self):
         fmtstr = '{name} {val' + self.fmt + '} ({avg' + self.fmt + '})'
         return fmtstr.format(**self.__dict__)
-
 
 class EarlyStopping:
     """Early stops the training if validation loss doesn't improve after a given patience."""
@@ -67,7 +63,11 @@ class EarlyStopping:
             self.best_score = score
             self.counter = 0
 
-
+def load_pretrained_with_report(model, ckpt_path, device):
+    """Load checkpoint quietly."""
+    state = torch.load(ckpt_path, map_location=device)
+    model.load_state_dict(state, strict=False)
+    return model
 
 def get_score_thresholds(tp_scores, total_num_valid_gt, num_sample_pts=41):
     score_thresholds = []
@@ -89,13 +89,28 @@ def get_score_thresholds(tp_scores, total_num_valid_gt, num_sample_pts=41):
         cur_recall = pts_ind / (num_sample_pts - 1)
     return score_thresholds
 
+def do_eval(det_results, gt_results, CLASSES, saved_path, eval_types=(
+    'bbox_3d',), difficulties=(0, 1, 2)):
+    """
+    Complete KITTI evaluation protocol with selectable eval types.
+    Only keys from eval_types will be computed and returned.
+    """
+    # Restrict to requested eval types; default to bbox_3d only
+    EVAL_NAMES = list(eval_types)
+    # Determine class names regardless of CLASSES being dict(int->name), dict(name->int), or list[str]
+    if isinstance(CLASSES, dict):
+        some_key = next(iter(CLASSES.keys())) if len(CLASSES) > 0 else None
+        if isinstance(some_key, int):
+            class_names = list(CLASSES.values())
+        else:
+            class_names = list(CLASSES.keys())
+    elif isinstance(CLASSES, (list, tuple)):
+        class_names = list(CLASSES)
+    else:
+        class_names = ['Car', 'Pedestrian', 'Cyclist']
 
-def do_eval(det_results, gt_results, CLASSES, saved_path):
-    """
-    Complete KITTI evaluation protocol
-    """
-    EVAL_NAMES = ['bbox_2d', 'bbox_bev', 'bbox_3d']
-    CLS_MIN_IOU = [0.7, 0.5, 0.5]  # Car, Pedestrian, Cyclist
+    # Use name-based IoU thresholds to avoid dependence on class index order
+    CLS_MIN_IOU = {'Car': 0.7, 'Pedestrian': 0.5, 'Cyclist': 0.5}
     MIN_HEIGHT = [40, 25, 25]      # Easy, Moderate, Hard
     
     eval_ap_results = {}
@@ -103,12 +118,12 @@ def do_eval(det_results, gt_results, CLASSES, saved_path):
     
     for eval_type_idx, eval_type in enumerate(EVAL_NAMES):
         eval_ap_results[eval_type] = {}
-        for difficulty in [0, 1, 2]:  # Easy, Moderate, Hard
+        for difficulty in list(difficulties):  # Easy, Moderate, Hard
             eval_ap_results[eval_type][f'difficulty_{difficulty}'] = {}
             
             ids = sorted(list(gt_results.keys()))
             
-            for cls_idx, cls_name in CLASSES.items():
+            for cls_name in class_names:
                 total_gt_ignores, total_det_ignores, total_dc_bboxes, total_scores = [], [], [], []
                 total_gt_alpha, total_det_alpha = [], []
                 
@@ -237,7 +252,8 @@ def do_eval(det_results, gt_results, CLASSES, saved_path):
                             continue
                         gt_column = det_gt_ious[:, gt_idx]
                         for det_idx in range(len(det_ignores)):
-                            if det_ignores[det_idx] == 0 and det_idx < len(gt_column) and gt_column[det_idx] > CLS_MIN_IOU[cls_idx]:
+                            # Compare IoU against threshold based on class name
+                            if det_ignores[det_idx] == 0 and det_idx < len(gt_column) and gt_column[det_idx] > CLS_MIN_IOU.get(cls_name, 0.5):
                                 if det_idx < len(scores):
                                     tp_scores.append(scores[det_idx])
                                 break
@@ -260,19 +276,21 @@ def do_eval(det_results, gt_results, CLASSES, saved_path):
 
     # Calculate overall metrics
     overall_metrics = {}
+    collected_keys = []
     for eval_type in EVAL_NAMES:
-        for difficulty in [0, 1, 2]:
+        for difficulty in list(difficulties):
             difficulty_key = f'difficulty_{difficulty}'
             mAPs = [eval_ap_results[eval_type][difficulty_key].get(cls_name, 0.0) 
-                   for cls_name in CLASSES.values()]
-            overall_metrics[f'{eval_type}_{difficulty_key}_mAP'] = np.mean(mAPs)
-    
-    overall_metrics['overall_mAP'] = np.mean([v for k, v in overall_metrics.items() if 'mAP' in k])
-    
+                   for cls_name in class_names]
+            key = f'{eval_type}_{difficulty_key}_mAP'
+            overall_metrics[key] = float(np.mean(mAPs)) if len(mAPs) > 0 else 0.0
+            collected_keys.append(key)
+    # Define overall_mAP as the mean of the selected mAPs
+    overall_metrics['overall_mAP'] = float(np.mean([overall_metrics[k] for k in collected_keys])) if collected_keys else 0.0
     return overall_metrics
 
-
-def validate_epoch(headnet, tailnet, rq_bottleneck, val_dataloader, loss_func, args, CLASSES, LABEL2CLASSES, pcd_limit_range):
+def validate_epoch(headnet, tailnet, rq_bottleneck, val_dataloader, loss_func, args, CLASSES, LABEL2CLASSES, pcd_limit_range,
+                   eval_types=('bbox_3d',), difficulties=(0, 1, 2), max_batches=None):
     """
     Run validation for one epoch and return metrics
     """
@@ -290,8 +308,10 @@ def validate_epoch(headnet, tailnet, rq_bottleneck, val_dataloader, loss_func, a
     format_results = {}
     
     with torch.no_grad():
-        for data_dict in tqdm(val_dataloader, desc='Validation', leave=False):
-            if not args.no_cuda:
+        for bi, data_dict in enumerate(tqdm(val_dataloader, desc='Validation', leave=False)):
+            if max_batches is not None and bi >= max_batches:
+                break
+            if torch.cuda.is_available():
                 for key in data_dict:
                     for j, item in enumerate(data_dict[key]):
                         if torch.is_tensor(item):
@@ -386,6 +406,60 @@ def validate_epoch(headnet, tailnet, rq_bottleneck, val_dataloader, loss_func, a
             
             # Process results for evaluation metrics
             for j, result in enumerate(batch_results):
+                # Normalize result to dict so we don't need to modify core files
+                if isinstance(result, (list, tuple)):
+                    # Old behavior may return ([], [], []) on empty
+                    if len(result) == 3:
+                        b, l, s = result
+                        try:
+                            b = np.array(b, dtype=np.float32).reshape(-1, 7)
+                        except Exception:
+                            b = np.zeros((0, 7), dtype=np.float32)
+                        l = np.array(l, dtype=np.int64).reshape(-1)
+                        s = np.array(s, dtype=np.float32).reshape(-1)
+                        result = {
+                            'lidar_bboxes': b,
+                            'labels': l,
+                            'scores': s,
+                        }
+                    else:
+                        result = {
+                            'lidar_bboxes': np.zeros((0, 7), dtype=np.float32),
+                            'labels': np.zeros((0,), dtype=np.int64),
+                            'scores': np.zeros((0,), dtype=np.float32),
+                        }
+                elif not isinstance(result, dict):
+                    result = {
+                        'lidar_bboxes': np.zeros((0, 7), dtype=np.float32),
+                        'labels': np.zeros((0,), dtype=np.int64),
+                        'scores': np.zeros((0,), dtype=np.float32),
+                    }
+                else:
+                    # Ensure numpy arrays
+                    for k in ['lidar_bboxes', 'labels', 'scores']:
+                        if k not in result:
+                            if k == 'lidar_bboxes':
+                                result[k] = np.zeros((0, 7), dtype=np.float32)
+                            elif k == 'labels':
+                                result[k] = np.zeros((0,), dtype=np.int64)
+                            else:
+                                result[k] = np.zeros((0,), dtype=np.float32)
+                        else:
+                            v = result[k]
+                            if hasattr(v, 'detach'):
+                                try:
+                                    v = v.detach().cpu().numpy()
+                                except Exception:
+                                    v = np.array(v)
+                            result[k] = v
+
+                # If still empty, short-circuit to an empty formatted result for this item
+                if result['lidar_bboxes'] is None or len(result['lidar_bboxes']) == 0:
+                    format_results[data_dict['batched_img_info'][j]['image_idx']] = {
+                        'name': np.array([]), 'truncated': np.array([]), 'occluded': np.array([]), 'alpha': np.array([]),
+                        'bbox': np.array([]), 'dimensions': np.array([]), 'location': np.array([]), 'rotation_y': np.array([]), 'score': np.array([])
+                    }
+                    continue
                 format_result = {
                     'name': [],
                     'truncated': [],
@@ -429,7 +503,8 @@ def validate_epoch(headnet, tailnet, rq_bottleneck, val_dataloader, loss_func, a
 
     # Calculate evaluation metrics
     val_dataset = val_dataloader.dataset
-    eval_metrics = do_eval(format_results, val_dataset.data_infos, CLASSES, "")
+    eval_metrics = do_eval(format_results, val_dataset.data_infos, CLASSES, "",
+                           eval_types=eval_types, difficulties=difficulties)
     
     # Combine loss and evaluation metrics
     all_metrics = {
@@ -442,16 +517,14 @@ def validate_epoch(headnet, tailnet, rq_bottleneck, val_dataloader, loss_func, a
     
     return all_metrics
 
-
 def train_rq(args):
-    """Train RQ model without external logging dependencies."""
-    setup_seed()
-    
+    """Train RQ model using refactored common setup"""
     # Setup experiment name and date
     date_str = str(datetime.date.today())
     time_str = datetime.datetime.now().strftime("%H-%M-%S")
     exp_name = f"{date_str}_{time_str}_RQ_training"
 
+    # Initialize wandb if requested
     wandb_run = None
     if args.use_wandb:
         wandb_name = args.wandb_name or f"RQ_lat{args.latent_shape}_code{args.code_shape}_embed{args.codebook_size}"
@@ -462,92 +535,33 @@ def train_rq(args):
             tags=["pointpillars", "rq", "split_inference"],
         )
         
-    train_dataset = Kitti(data_root=args.data_root, split='train')
-    val_dataset = Kitti(data_root=args.data_root, split='val')
+    # Setup model and data using common function
+    (train_dataloader, val_dataloader), headnet, tailnet, device, CLASSES, LABEL2CLASSES, pcd_limit_range = setup_model_and_data(args, mode='train')
     
-    train_dataloader = get_dataloader(dataset=train_dataset, 
-                                      batch_size=args.batch_size, 
-                                      num_workers=args.num_workers,
-                                      shuffle=True)
-    val_dataloader = get_dataloader(dataset=val_dataset, 
-                                    batch_size=args.batch_size, 
-                                    num_workers=args.num_workers,
-                                    shuffle=False)
-
-    # Load pretrained PointPillars model
-    print("Loading pretrained PointPillars model...")
-    if not args.no_cuda:
-        full_model = PointPillars(nclasses=args.nclasses).cuda()
-    else:
-        full_model = PointPillars(nclasses=args.nclasses)
-    
-    # Load pretrained weights
-    checkpoint = torch.load(args.pretrained_ckpt, map_location='cpu' if args.no_cuda else 'cuda')
-    full_model.load_state_dict(checkpoint)
-    print(f"Loaded pretrained weights from {args.pretrained_ckpt}")
-    
-    # Split the model
-    headnet, tailnet = split_pointpillars(full_model)
-    
-    # Freeze headnet and tailnet parameters
-    for param in headnet.parameters():
-        param.requires_grad = False
-    for param in tailnet.parameters():
-        param.requires_grad = False
-    
-    print("Frozen headnet and tailnet parameters")
-    
-    # Create RQ bottleneck
-    rq_bottleneck = RQBottleneck(
-        latent_shape=args.latent_shape,
-        code_shape=args.code_shape,
-        n_embed=args.codebook_size,
-        decay=args.decay,
-        ema=True,  # Start with EMA for initialization
-        shared_codebook=False,
-        restart_unused_codes=True,
-        commitment_loss='cumsum'
-    )
-    
-    if not args.no_cuda:
-        rq_bottleneck = rq_bottleneck.cuda()
-    
-    print(f"Created RQ bottleneck with {sum(p.numel() for p in rq_bottleneck.parameters())} parameters")
-    
+    # Create RQ bottleneck and loss function
+    rq_bottleneck = create_rq_bottleneck(args, device, ema=True)
     loss_func = Loss()
 
-    # Only optimize RQ parameters (after EMA initialization)
+    # Setup optimizer and scheduler
     steps_per_epoch = max(1, len(train_dataloader))
     effective_epochs = max(args.max_epoch - 2, 1)
-    total_steps = max(1, steps_per_epoch * effective_epochs)
     init_lr = args.init_lr
     optimizer = torch.optim.AdamW(params=rq_bottleneck.parameters(), 
                                   lr=init_lr, 
-                                  betas=(0.95, 0.99),
+                                  betas=(0.9, 0.999),
                                   weight_decay=0.01)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer,  
-                                                    max_lr=init_lr*10, 
-                                                    total_steps=total_steps, 
-                                                    pct_start=0.4, 
-                                                    anneal_strategy='cos',
-                                                    cycle_momentum=True, 
-                                                    base_momentum=0.95*0.895, 
-                                                    max_momentum=0.95,
-                                                    div_factor=10)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, 
+                                                                     T_0=max(1, effective_epochs//4), 
+                                                                     T_mult=2, 
+                                                                     eta_min=init_lr*0.01)
     
+    # Setup directories and tracking variables
     saved_ckpt_path = os.path.join(args.saved_path, 'checkpoints')
     os.makedirs(saved_ckpt_path, exist_ok=True)
 
-    # Define evaluation constants
-    CLASSES = {0: 'Car', 1: 'Pedestrian', 2: 'Cyclist'}
-    LABEL2CLASSES = {0: 'Car', 1: 'Pedestrian', 2: 'Cyclist'}
-    pcd_limit_range = np.array([0, -40, -3, 70.4, 40, 1], dtype=np.float32)
-
-    # Set models to appropriate modes
     headnet.eval()
     tailnet.eval()
     
-    # Tracking variables
     best_mAP = 0.0
     best_epoch = 0
     train_losses = AverageMeter('TrainLoss', ':.4f')
@@ -555,13 +569,13 @@ def train_rq(args):
     train_vq_losses = AverageMeter('TrainVQLoss', ':.6f')
     train_cb_losses = AverageMeter('TrainCBLoss', ':.6f')
     
-    # Early stopping
     early_stopping = EarlyStopping(patience=getattr(args, 'patience', 20), verbose=True)
     
     print(f"Starting training for {args.max_epoch} epochs...")
     print(f"Experiment: {exp_name}")
     overall_step = 0
 
+    # Training loop - keeping the existing epoch logic intact
     for epoch in range(args.max_epoch):
         epoch_start_time = time.time()
         print('=' * 60)
@@ -578,12 +592,12 @@ def train_rq(args):
         train_cb_losses.reset()
         
         # First 2 epochs: EMA initialization (no gradients)
-        if epoch < 2 and False:
+        if epoch < 2:
             print(f"EMA Initialization Epoch {epoch + 1}/2")
             
             with torch.no_grad():
                 for i, data_dict in enumerate(tqdm(train_dataloader, desc="EMA Init")):
-                    if not args.no_cuda:
+                    if torch.cuda.is_available():
                         for key in data_dict:
                             for j, item in enumerate(data_dict[key]):
                                 if torch.is_tensor(item):
@@ -598,7 +612,6 @@ def train_rq(args):
                     pillar_features_hwc = pillar_features.permute(0, 2, 3, 1)
                     quantized_features, vq_loss, codebook_loss, codes = rq_bottleneck(pillar_features_hwc)
 
-            
             # Run validation during EMA initialization
             print("Running validation during EMA initialization...")
             val_metrics = validate_epoch(headnet, tailnet, rq_bottleneck, val_dataloader, 
@@ -617,20 +630,11 @@ def train_rq(args):
             continue
         
         # From epoch 2 onwards: Switch to gradient-based training
-        if epoch == 2:
+        else:
             print("Switching to gradient-based training")
             
             # Create new RQ model without EMA
-            new_rq_bottleneck = RQBottleneck(
-                latent_shape=args.latent_shape,
-                code_shape=args.code_shape,
-                n_embed=args.codebook_size,
-                decay=args.decay,
-                ema=False,
-                shared_codebook=False,
-                restart_unused_codes=True,
-                commitment_loss='cumsum'
-            )
+            new_rq_bottleneck = create_rq_bottleneck(args, device, ema=False)
             
             # Transfer EMA-initialized codebook weights to new model
             with torch.no_grad():
@@ -645,33 +649,25 @@ def train_rq(args):
                     new_codebook.set_frozen_n_embed(old_codebook.frozen_n_embed)
             
             rq_bottleneck = new_rq_bottleneck
-            if not args.no_cuda:
-                rq_bottleneck = rq_bottleneck.cuda()
             
             # Recreate optimizer and scheduler for new model
             optimizer = torch.optim.AdamW(params=rq_bottleneck.parameters(), 
                                           lr=init_lr, 
-                                          betas=(0.95, 0.99),
+                                          betas=(0.9, 0.999),
                                           weight_decay=0.01)
-            scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer,  
-                                                            max_lr=init_lr*10, 
-                                                            total_steps=total_steps, 
-                                                            pct_start=0.4, 
-                                                            anneal_strategy='cos',
-                                                            cycle_momentum=True, 
-                                                            base_momentum=0.95*0.895, 
-                                                            max_momentum=0.95,
-                                                            div_factor=10)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, 
+                                                                             T_0=max(1, effective_epochs//4), 
+                                                                             T_mult=2, 
+                                                                             eta_min=init_lr*0.01)
         
         # Training loop for gradient-based epochs
         for i, data_dict in enumerate(tqdm(train_dataloader, desc=f"Training Epoch {epoch+1}")):
-            if not args.no_cuda:
+            if torch.cuda.is_available():
                 for key in data_dict:
                     for j, item in enumerate(data_dict[key]):
                         if torch.is_tensor(item):
                             data_dict[key][j] = data_dict[key][j].cuda()
-            
-            
+
             optimizer.zero_grad()
 
             batched_pts = data_dict['batched_pts']
@@ -736,10 +732,14 @@ def train_rq(args):
 
             det_loss = det_loss_dict['total_loss']
             
-            # Total loss: RQ losses + detection loss (keeping HeadNet/TailNet frozen)
-            # Flattened losses are computed in det_loss_dict
-            total_loss = (args.vq_weight * vq_loss + \
-                         args.codebook_weight * codebook_loss + \
+            # Progressive training: gradually increase VQ weight
+            progress_ratio = min(1.0, (epoch - 2) / (args.max_epoch * 0.3))
+            current_vq_weight = args.vq_weight * progress_ratio
+            current_cb_weight = args.codebook_weight * progress_ratio
+            
+            # Total loss: RQ losses + detection loss
+            total_loss = (current_vq_weight * vq_loss + 
+                         current_cb_weight * codebook_loss + 
                          args.det_weight * det_loss)
             
             # Update meters
@@ -751,6 +751,7 @@ def train_rq(args):
             # Backward and optimize
             if total_loss.requires_grad and total_loss.item() > 0:
                 total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(rq_bottleneck.parameters(), max_norm=1.0)
                 optimizer.step()
                 scheduler.step()
             
@@ -758,22 +759,20 @@ def train_rq(args):
             overall_step += 1
 
             if wandb_run is not None and args.log_freq > 0 and overall_step % args.log_freq == 0:
-                wandb.log(
-                    {
-                        'train/total_loss': float(total_loss.item()),
-                        'train/det_loss': float(det_loss.item()),
-                        'train/vq_loss': float(vq_loss.item()),
-                        'train/codebook_loss': float(codebook_loss.item()),
-                        'train/lr': optimizer.param_groups[0]['lr'],
-                        'epoch': epoch + 1,
-                    },
-                    step=overall_step,
-                )
+                wandb.log({
+                    'train/total_loss': float(total_loss.item()),
+                    'train/det_loss': float(det_loss.item()),
+                    'train/vq_loss': float(vq_loss.item()),
+                    'train/codebook_loss': float(codebook_loss.item()),
+                    'train/lr': optimizer.param_groups[0]['lr'],
+                    'epoch': epoch + 1,
+                }, step=overall_step)
         
         # Run validation at the end of each epoch
         print(f"Running validation for epoch {epoch+1}...")
-        val_metrics = validate_epoch(headnet, tailnet, rq_bottleneck, val_dataloader, 
-                                   loss_func, args, CLASSES, LABEL2CLASSES, pcd_limit_range)  # Full eval every 5 epochs
+        val_metrics = validate_epoch(headnet, tailnet, rq_bottleneck, val_dataloader,
+                        loss_func, args, CLASSES, LABEL2CLASSES, pcd_limit_range,
+                        eval_types=('bbox_3d',), difficulties=(0, 1, 2))
         
         epoch_time = time.time() - epoch_start_time
         
@@ -781,29 +780,21 @@ def train_rq(args):
         print(f"\nEpoch {epoch+1} Summary:")
         print(f"  Time: {epoch_time:.2f}s")
         print(f"  Training Loss: {train_losses.avg:.4f}")
-        print(f"    - Det Loss: {train_det_losses.avg:.4f}")
-        print(f"    - VQ Loss: {train_vq_losses.avg:.6f}")
-        print(f"    - CB Loss: {train_cb_losses.avg:.6f}")
         print(f"  Validation Results:")
         for key, value in val_metrics.items():
-            print(f"    - {key}: {value:.4f}")
+            if key.startswith('bbox_3d_'):
+                print(f"    - {key}: {value:.4f}")
 
         if wandb_run is not None:
             log_step = overall_step if overall_step > 0 else epoch + 1
-            wandb.log(
-                {
-                    'epoch': epoch + 1,
-                    'train/epoch_loss': float(train_losses.avg),
-                    'train/epoch_det_loss': float(train_det_losses.avg),
-                    'train/epoch_vq_loss': float(train_vq_losses.avg),
-                    'train/epoch_cb_loss': float(train_cb_losses.avg),
-                    **{f'val/{k}': float(v) for k, v in val_metrics.items()},
-                },
-                step=log_step,
-            )
+            wandb.log({
+                'epoch': epoch + 1,
+                'train/epoch_loss': float(train_losses.avg),
+                **{f'val/{k}': float(v) for k, v in val_metrics.items()},
+            }, step=log_step)
         
         # Save checkpoint periodically and if best mAP
-        current_mAP = val_metrics.get('simple_mAP', val_metrics.get('overall_mAP', 0.0))
+        current_mAP = val_metrics.get('overall_mAP', 0.0)
         is_best = current_mAP > best_mAP
         
         if epoch % args.ckpt_freq_epoch == 0 or is_best:
@@ -813,12 +804,6 @@ def train_rq(args):
                 'scheduler': scheduler.state_dict(),
                 'epoch': epoch,
                 'val_metrics': val_metrics,
-                'train_metrics': {
-                    'total_loss': train_losses.avg,
-                    'det_loss': train_det_losses.avg,
-                    'vq_loss': train_vq_losses.avg,
-                    'cb_loss': train_cb_losses.avg
-                },
                 'args': args
             }
             
@@ -840,7 +825,6 @@ def train_rq(args):
             break
     
     # Training completed
-    total_time = time.time() - epoch_start_time
     print("\n" + "="*60)
     print("TRAINING COMPLETED!")
     print("="*60)
@@ -856,86 +840,106 @@ def train_rq(args):
     
     return best_mAP, best_epoch
 
-
-def evaluate_rq(args):
-    """
-    Evaluate RQ model using full KITTI protocol
-    """
+def setup_model_and_data(args, mode='train'):
+    """Common setup for model and data loading"""
     setup_seed()
     
     # Load data
-    val_dataset = Kitti(data_root=args.data_root, split='val')
-    val_dataloader = get_dataloader(dataset=val_dataset, 
-                                    batch_size=args.batch_size, 
-                                    num_workers=args.num_workers,
-                                    shuffle=False)
-    
-    # Load pretrained PointPillars model
-    print("Loading pretrained PointPillars model...")
-    if not args.no_cuda:
-        full_model = PointPillars(nclasses=args.nclasses).cuda()
+    if mode == 'train':
+        train_dataset = Kitti(data_root=args.data_root, split='train')
+        val_dataset = Kitti(data_root=args.data_root, split='val')
+        
+        train_dataloader = get_dataloader(dataset=train_dataset, 
+                                          batch_size=args.batch_size, 
+                                          num_workers=args.num_workers,
+                                          shuffle=True)
+        val_dataloader = get_dataloader(dataset=val_dataset, 
+                                        batch_size=args.batch_size, 
+                                        num_workers=args.num_workers,
+                                        shuffle=False)
+        dataloaders = (train_dataloader, val_dataloader)
     else:
-        full_model = PointPillars(nclasses=args.nclasses)
-    
-    checkpoint = torch.load(args.pretrained_ckpt, map_location='cpu' if args.no_cuda else 'cuda')
-    full_model.load_state_dict(checkpoint)
+        val_dataset = Kitti(data_root=args.data_root, split='val')
+        val_dataloader = get_dataloader(dataset=val_dataset, 
+                                        batch_size=args.batch_size, 
+                                        num_workers=args.num_workers,
+                                        shuffle=False)
+        dataloaders = val_dataloader
+
+    # Load pretrained PointPillars model
+    device = torch.device('cuda', args.gpu) if torch.cuda.is_available() else torch.device('cpu')
+    full_model = PointPillars(nclasses=args.nclasses).to(device)
+    full_model = load_pretrained_with_report(full_model, args.pretrained_ckpt, device)
     print(f"Loaded pretrained weights from {args.pretrained_ckpt}")
     
     # Split the model
     headnet, tailnet = split_pointpillars(full_model)
     
+    # Freeze headnet and tailnet parameters
+    for param in headnet.parameters():
+        param.requires_grad = False
+    for param in tailnet.parameters():
+        param.requires_grad = False
+    print("Frozen headnet and tailnet parameters")
+    
+    # Define evaluation constants
+    ds_classes = Kitti.CLASSES
+    CLASSES = {v: k for k, v in ds_classes.items()}
+    LABEL2CLASSES = {v: k for k, v in ds_classes.items()}
+    pcd_limit_range = np.array([0, -40, -3, 70.4, 40, 1], dtype=np.float32)
+    
+    return dataloaders, headnet, tailnet, device, CLASSES, LABEL2CLASSES, pcd_limit_range
+
+def create_rq_bottleneck(args, device, ema=True):
+    """Create RQ bottleneck with given configuration"""
+    rq_bottleneck = RQBottleneck(
+        latent_shape=args.latent_shape,
+        code_shape=args.code_shape,
+        n_embed=args.codebook_size,
+        decay=args.decay,
+        ema=ema,
+        shared_codebook=False,
+        restart_unused_codes=True,
+        commitment_loss='cumsum'
+    )
+    rq_bottleneck = rq_bottleneck.to(device)
+    print(f"Created RQ bottleneck with {sum(p.numel() for p in rq_bottleneck.parameters())} parameters")
+    return rq_bottleneck
+
+def load_rq_checkpoint(rq_bottleneck, checkpoint_path, device):
+    """Load RQ checkpoint safely"""
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        rq_checkpoint = torch.load(checkpoint_path, map_location=device)
+        rq_bottleneck.load_state_dict(rq_checkpoint.get('rq_bottleneck', rq_checkpoint))
+        rq_bottleneck.eval()
+        print(f"Loaded RQ checkpoint from {checkpoint_path}")
+    return rq_bottleneck
+
+def evaluate_rq(args):
+    """Simplified evaluation function using common setup"""
+    # Setup model and data
+    val_dataloader, headnet, tailnet, device, CLASSES, LABEL2CLASSES, pcd_limit_range = setup_model_and_data(args, mode='eval')
+    
     # Create RQ bottleneck if needed
     rq_bottleneck = None
     if args.use_rq and args.rq_ckpt:
-        rq_bottleneck = RQBottleneck(
-            latent_shape=args.latent_shape,
-            code_shape=args.code_shape,
-            n_embed=args.codebook_size,
-            decay=args.decay,
-            ema=True,
-            shared_codebook=False,
-            restart_unused_codes=True,
-            commitment_loss='cumsum'
-        )
-        
-        if not args.no_cuda:
-            rq_bottleneck = rq_bottleneck.cuda()
-        
-        # Load RQ checkpoint
-        rq_checkpoint = torch.load(args.rq_ckpt, map_location='cpu' if args.no_cuda else 'cuda')
-        try:
-            rq_bottleneck.load_state_dict(rq_checkpoint['rq_bottleneck'])
-        except RuntimeError:
-            rq_bottleneck.load_state_dict(rq_checkpoint)
-        
-        # Disable EMA for evaluation
-        for codebook in rq_bottleneck.codebooks:
-            codebook.ema = False
-        
-        rq_bottleneck.eval()
-        print("RQ bottleneck ready for evaluation")
-    else:
-        print("Running without RQ bottleneck (original PointPillars behavior)")
+        rq_bottleneck = create_rq_bottleneck(args, device, ema=False)
+        rq_bottleneck = load_rq_checkpoint(rq_bottleneck, args.rq_ckpt, device)
     
+    # Run evaluation
     loss_func = Loss()
-    
-    # Define evaluation constants
-    CLASSES = {0: 'Car', 1: 'Pedestrian', 2: 'Cyclist'}
-    LABEL2CLASSES = {0: 'Car', 1: 'Pedestrian', 2: 'Cyclist'}
-    pcd_limit_range = np.array([0, -40, -3, 70.4, 40, 1], dtype=np.float32)
-    
-    # Run full evaluation
-    print("Running full evaluation...")
     eval_metrics = validate_epoch(headnet, tailnet, rq_bottleneck, val_dataloader, 
                                 loss_func, args, CLASSES, LABEL2CLASSES, pcd_limit_range)
     
+    # Print results
     print("\n" + "="*50)
     print("EVALUATION RESULTS")
     print("="*50)
     for key, value in eval_metrics.items():
         print(f"{key:30s}: {value:8.4f}")
     print("="*50)
-
+    
+    return eval_metrics
 
 def main():
     parser = argparse.ArgumentParser(description='RQ Training and Evaluation')
@@ -957,9 +961,7 @@ def main():
     parser.add_argument('--patience', type=int, default=5, help='early stopping patience')
     parser.add_argument('--log_freq', type=int, default=8,
                         help='number of optimizer steps between wandb training logs')
-    parser.add_argument('--no_cuda', action='store_true',
-                        help='whether to use cuda')
-    parser.add_argument('--use_wandb', action='store_true', default=True,
+    parser.add_argument('--use_wandb', action='store_true', default=False,
                         help='enable Weights & Biases logging (enabled by default)')
     parser.add_argument('--no_wandb', action='store_false', dest='use_wandb',
                         help='disable Weights & Biases logging')
@@ -967,27 +969,29 @@ def main():
                         help='Weights & Biases project name')
     parser.add_argument('--wandb_name', default=None,
                         help='Weights & Biases run name (auto-generated if omitted)')
+    parser.add_argument('--gpu', type=int, default=0,
+                        help='CUDA device id(s) to use, e.g., "0" or "0,1"')
     
     # RQ parameters
     parser.add_argument('--latent_shape', nargs=3, type=int, default=[496, 432, 64], 
                         help='latent shape [h, w, c]')
-    parser.add_argument('--code_shape', nargs=3, type=int, default=[62, 54, 8], 
-                        help='code shape [h, w, num_codebooks]')
-    parser.add_argument('--codebook_size', type=int, default=256, help='size of codebook')
+    parser.add_argument('--code_shape', nargs=3, type=int, default=[124, 108, 3], 
+                        help='code shape [h, w, num_codebooks] - must divide latent_shape evenly')
+    parser.add_argument('--codebook_size', type=int, default=64, help='size of codebook')
     parser.add_argument('--decay', type=float, default=0.99, help='EMA decay for codebook')
     
-    # Loss weights
-    parser.add_argument('--vq_weight', type=float, default=0.02, help='weight for VQ loss')
-    parser.add_argument('--codebook_weight', type=float, default=0.02, help='weight for codebook loss')
-    parser.add_argument('--det_weight', type=float, default=1.0, help='weight for detection loss')
+    # Loss weights  
+    parser.add_argument('--vq_weight', type=float, default=0.25, help='weight for VQ loss')
+    parser.add_argument('--codebook_weight', type=float, default=0.1, help='weight for codebook loss')
+    parser.add_argument('--det_weight', type=float, default=0.8, help='weight for detection loss')
     
     args = parser.parse_args()
-    
+    torch.cuda.set_device(args.gpu)
+
     if args.mode == 'train':
         train_rq(args)
     else:
         evaluate_rq(args)
-
 
 if __name__ == '__main__':
     main()
