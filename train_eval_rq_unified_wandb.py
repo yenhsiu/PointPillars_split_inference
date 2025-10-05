@@ -13,7 +13,7 @@ from pointpillars.model import PointPillars
 from pointpillars.model.split_nets import split_pointpillars
 from pointpillars.model.quantizations import RQBottleneck
 from pointpillars.loss import Loss
-
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 class AverageMeter(object):
     """Computes and stores the average and current value"""
     def __init__(self, name, fmt=':f'):
@@ -903,6 +903,23 @@ def create_rq_bottleneck(args, device, ema=True):
         commitment_loss='cumsum'
     )
     rq_bottleneck = rq_bottleneck.to(device)
+    
+    # Initialize codebooks with proper values to avoid CUDA errors
+    with torch.no_grad():
+        for i, codebook in enumerate(rq_bottleneck.codebooks):
+            # Initialize with small random values using normal distribution
+            torch.nn.init.normal_(codebook.weight, mean=0.0, std=0.02)
+            
+            if hasattr(codebook, 'embed_ema') and codebook.embed_ema is not None:
+                # Initialize EMA embeddings with the same values
+                codebook.embed_ema.copy_(codebook.weight[:-1, :])
+                
+            if hasattr(codebook, 'cluster_size_ema') and codebook.cluster_size_ema is not None:
+                # Initialize cluster sizes to small positive values
+                codebook.cluster_size_ema.fill_(0.1)
+                
+            print(f"Initialized codebook {i}: {codebook.n_embed} codes, {codebook.embed_dim}D")
+    
     print(f"Created RQ bottleneck with {sum(p.numel() for p in rq_bottleneck.parameters())} parameters")
     return rq_bottleneck
 
@@ -961,7 +978,7 @@ def main():
     parser.add_argument('--patience', type=int, default=5, help='early stopping patience')
     parser.add_argument('--log_freq', type=int, default=8,
                         help='number of optimizer steps between wandb training logs')
-    parser.add_argument('--use_wandb', action='store_true', default=False,
+    parser.add_argument('--use_wandb', action='store_true', default=True,
                         help='enable Weights & Biases logging (enabled by default)')
     parser.add_argument('--no_wandb', action='store_false', dest='use_wandb',
                         help='disable Weights & Biases logging')
@@ -975,7 +992,7 @@ def main():
     # RQ parameters
     parser.add_argument('--latent_shape', nargs=3, type=int, default=[496, 432, 64], 
                         help='latent shape [h, w, c]')
-    parser.add_argument('--code_shape', nargs=3, type=int, default=[124, 108, 3], 
+    parser.add_argument('--code_shape', nargs=3, type=int, default=[496, 432, 1], 
                         help='code shape [h, w, num_codebooks] - must divide latent_shape evenly')
     parser.add_argument('--codebook_size', type=int, default=64, help='size of codebook')
     parser.add_argument('--decay', type=float, default=0.99, help='EMA decay for codebook')

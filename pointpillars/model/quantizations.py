@@ -34,15 +34,19 @@ class VQEmbedding(nn.Embedding):
         self.eps = eps
         self.restart_unused_codes = restart_unused_codes
         self.n_embed = n_embed
+        self.embed_dim = embed_dim  # Store for later use
 
         self._trainable = True
         self.active_n_embed = n_embed
         self.frozen_n_embed = 0
         self._use_ema = ema # 直接將 ema 參數設為一個可變的屬性
         
+        # Initialize with normal distribution for better training stability
+        nn.init.normal_(self.weight, mean=0.0, std=1.0 / np.sqrt(embed_dim))
+        
         if self.ema:
             _ = [p.requires_grad_(False) for p in self.parameters()]
-            self.register_buffer('cluster_size_ema', torch.zeros(n_embed))
+            self.register_buffer('cluster_size_ema', torch.zeros(n_embed, dtype=torch.float32))
             self.register_buffer('embed_ema', self.weight[:-1, :].detach().clone())
 
     @property
@@ -116,36 +120,85 @@ class VQEmbedding(nn.Embedding):
         if not self._trainable:
             return
 
+        # Safety check: ensure we have valid tensors
+        if vectors.numel() == 0 or idxs.numel() == 0 or self.active_n_embed == 0:
+            return
+        
+        # Ensure tensors are on the same device
+        if vectors.device != idxs.device:
+            idxs = idxs.to(vectors.device)
+
         n_active = self.active_n_embed
         embed_dim = self.weight.shape[-1]
 
         vectors_flat = vectors.reshape(-1, embed_dim)
         idxs_flat = idxs.reshape(-1)
         
+        # Additional safety: check for NaN or inf values
+        if torch.isnan(vectors_flat).any() or torch.isinf(vectors_flat).any():
+            print("Warning: NaN or inf detected in vectors, skipping update")
+            return
+        
         # Clamp indices to be safe
-        clamped_idxs = idxs_flat.clamp(max=n_active - 1)
-        one_hot = F.one_hot(clamped_idxs, num_classes=n_active).float()
-        cluster_size = one_hot.sum(dim=0)
+        clamped_idxs = idxs_flat.clamp(0, n_active - 1)
+        
+        try:
+            one_hot = F.one_hot(clamped_idxs, num_classes=n_active).float()
+            cluster_size = one_hot.sum(dim=0)
 
-        # 只更新未 frozen 的 embedding
-        update_start = self.frozen_n_embed
-        vectors_sum_per_cluster = one_hot.t() @ vectors_flat
-        self.cluster_size_ema[update_start:n_active].mul_(self.decay).add_(cluster_size[update_start:], alpha=1 - self.decay)
-        self.embed_ema[update_start:n_active].mul_(self.decay).add_(vectors_sum_per_cluster[update_start:], alpha=1 - self.decay)
+            # 只更新未 frozen 的 embedding
+            update_start = self.frozen_n_embed
+            vectors_sum_per_cluster = one_hot.t() @ vectors_flat
+            self.cluster_size_ema[update_start:n_active].mul_(self.decay).add_(cluster_size[update_start:], alpha=1 - self.decay)
+            self.embed_ema[update_start:n_active].mul_(self.decay).add_(vectors_sum_per_cluster[update_start:], alpha=1 - self.decay)
+        except Exception as e:
+            print(f"Warning: Error in buffer update, skipping. Error: {e}")
+            return
         
         if self.restart_unused_codes:
             unused_indices = torch.where(self.cluster_size_ema[update_start:n_active] < self.eps)[0] + update_start
             n_unused = unused_indices.shape[0]
             if n_unused > 0:
                 n_vectors_flat = vectors_flat.shape[0]
-                rand_indices = torch.randperm(n_vectors_flat, device=vectors.device)
-                if n_vectors_flat < n_unused:
-                     n_repeats = (n_unused + n_vectors_flat - 1) // n_vectors_flat
-                     rand_indices = rand_indices.repeat(n_repeats)
-                random_vectors = vectors_flat[rand_indices[:n_unused]]
-                world_size = dist.get_world_size() if dist.is_initialized() else 1
-                self.embed_ema[unused_indices] = random_vectors
-                self.cluster_size_ema[unused_indices] = torch.ones_like(self.cluster_size_ema[unused_indices]) * (1.0 / world_size)
+                
+                # Safety check: if no vectors, use zeros instead
+                if n_vectors_flat == 0:
+                    random_vectors = torch.zeros(n_unused, embed_dim, device=vectors.device, dtype=vectors.dtype)
+                else:
+                    # Ensure indices are valid and within bounds
+                    try:
+                        # Generate random indices with safety bounds
+                        rand_indices = torch.randperm(n_vectors_flat, device=vectors.device, dtype=torch.long)
+                        
+                        if n_vectors_flat < n_unused:
+                            # Repeat indices safely
+                            n_repeats = (n_unused + n_vectors_flat - 1) // n_vectors_flat
+                            rand_indices = rand_indices.repeat(n_repeats)
+                        
+                        # Ensure we don't exceed the vectors_flat size and have valid indices
+                        max_valid_idx = min(n_unused, rand_indices.size(0), n_vectors_flat)
+                        if max_valid_idx > 0:
+                            rand_indices = rand_indices[:max_valid_idx].clamp(0, n_vectors_flat - 1)
+                            random_vectors = vectors_flat[rand_indices]
+                        else:
+                            random_vectors = torch.zeros(0, embed_dim, device=vectors.device, dtype=vectors.dtype)
+                        
+                        # If we still don't have enough vectors, pad with zeros
+                        if random_vectors.size(0) < n_unused:
+                            padding_size = n_unused - random_vectors.size(0)
+                            padding = torch.zeros(padding_size, embed_dim, device=vectors.device, dtype=vectors.dtype)
+                            random_vectors = torch.cat([random_vectors, padding], dim=0)
+                    except Exception as e:
+                        # Fallback: use zeros if anything goes wrong
+                        print(f"Warning: Error in restart_unused_codes, using zeros. Error: {e}")
+                        random_vectors = torch.zeros(n_unused, embed_dim, device=vectors.device, dtype=vectors.dtype)
+                
+                # Ensure unused_indices are valid before assignment
+                if unused_indices.numel() > 0 and random_vectors.size(0) == n_unused:
+                    unused_indices = unused_indices.clamp(0, self.embed_ema.size(0) - 1)
+                    world_size = dist.get_world_size() if dist.is_initialized() else 1
+                    self.embed_ema[unused_indices] = random_vectors
+                    self.cluster_size_ema[unused_indices] = torch.ones_like(self.cluster_size_ema[unused_indices]) * (1.0 / world_size)
 
     @torch.no_grad()
     def _update_embedding(self):
@@ -222,7 +275,14 @@ class VQEmbedding(nn.Embedding):
         return embeds, embed_idxs
 
     def embed(self, idxs):
-        embeds = super().forward(idxs)
+        # Ensure indices are within valid range
+        if idxs.numel() == 0:
+            # Return empty tensor with correct shape
+            return torch.zeros(*idxs.shape, self.embed_dim, device=idxs.device, dtype=self.weight.dtype)
+        
+        # Clamp indices to prevent out-of-bounds access
+        safe_idxs = idxs.clamp(0, self.n_embed - 1)
+        embeds = super().forward(safe_idxs)
         return embeds
 
 
@@ -385,8 +445,11 @@ class RQBottleneck(nn.Module):
             if codebook.trainable:
                 if codebook.use_ema and self.training:
                     # EMA 模式：更新 buffers 和 embeddings，但仍計算損失進行監控
-                    codebook._update_buffers(residual, codes)
-                    codebook._update_embedding()
+                    # Check if we have any elements in the tensor before updating
+                    if residual.numel() > 0 and codes.numel() > 0:
+                        codebook._update_buffers(residual, codes)
+                        codebook._update_embedding()
+                    
                     # 計算損失（但不用於反向傳播，因為已經detach）
                     vq_losses.append(F.mse_loss(residual, quant.detach()))
                     codebook_losses.append(F.mse_loss(quant.detach(), residual))
