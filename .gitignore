@@ -7,3 +7,4 @@ tmp/
 results/
 *.sh
 .idea
+wandb/
