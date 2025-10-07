@@ -1,0 +1,64 @@
+seed: 42
+
+# Dataset configuration
+dataset:
+  name: KITTI
+  dir: "/home/yenhsiu/datasets"
+  num_classes: 3
+
+# Model configuration
+model:
+  pre_trained_model: "b0"
+  n_codebook: 5
+  pretrained_weight: 'pretrained/epoch_160.pth'
+  
+# Progressive learning configuration
+progressive_learning:
+  enabled: True
+  embedding_schedule: [16, 32, 64, 128, 256]  # embedding size schedule
+  embedding_stage_epochs: 20  # epochs per embedding stage
+  warmup_epochs: 2  # EMA warmup epochs per stage
+  
+# Training hyperparameters
+training:
+  mode: 'train'  # 'train' or 'eval'
+  batch_size: 6
+  num_workers: 4
+  max_epoch: 100  # total epochs (will be divided across stages in progressive mode)
+  init_lr: 0.001
+  ckpt_freq_epoch: 20
+  patience: 5
+  early_stopping_patience: 5
+  
+# RQ model parameters
+rq_model:
+  latent_shape: [496, 432, 64]
+  code_shape: [496, 432, 1] 
+  codebook_size: 64  # will be overridden by progressive schedule
+  decay: 0.99
+  
+# Loss weights
+loss_weights:
+  vq_weight: 0.25
+  codebook_weight: 0.1
+  det_weight: 0.8
+  
+# Evaluation configuration
+evaluation:
+  enabled: False
+  use_num_codebook: 1
+  use_num_embedding: 16
+  rq_ckpt: null
+  
+# Logging and saving
+logging:
+  use_wandb: True
+  wandb_project: "pointpillars-rq-progressive"
+  wandb_name: null
+  log_freq: 8
+  saved_path: "progressive_rq_logs"
+  save_stage_weights: True
+  
+# Hardware
+hardware:
+  gpu: 1

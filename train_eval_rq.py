@@ -6,6 +6,7 @@ import numpy as np
 import time
 import datetime
 import wandb
+import yaml
 from pointpillars.utils import setup_seed, keep_bbox_from_image_range, \
     keep_bbox_from_lidar_range, iou2d, iou3d_camera, iou_bev
 from pointpillars.dataset import Kitti, get_dataloader
@@ -517,6 +518,433 @@ def validate_epoch(headnet, tailnet, rq_bottleneck, val_dataloader, loss_func, a
     
     return all_metrics
 
+def train_progressive_rq(config):
+    """Progressive learning training using config from YAML"""
+    # Setup experiment name and date
+    date_str = str(datetime.date.today())
+    time_str = datetime.datetime.now().strftime("%H-%M-%S")
+    exp_name = f"{date_str}_{time_str}_Progressive_RQ_training"
+
+    # Initialize wandb if requested
+    wandb_run = None
+    if config['logging']['use_wandb']:
+        wandb_name = config['logging']['wandb_name'] or f"Progressive_RQ_{config['model']['n_codebook']}books"
+        wandb_run = wandb.init(
+            project=config['logging']['wandb_project'],
+            name=wandb_name,
+            config=config,
+            tags=["pointpillars", "rq", "progressive", "split_inference"],
+        )
+    
+    # Convert config to args-like object for compatibility
+    args = argparse.Namespace()
+    args.data_root = config['dataset']['dir']
+    args.pretrained_ckpt = config['model']['pretrained_weight']
+    args.batch_size = config['training']['batch_size']
+    args.num_workers = config['training']['num_workers']
+    args.nclasses = config['dataset']['num_classes']
+    args.latent_shape = config['rq_model']['latent_shape']
+    args.code_shape = config['rq_model']['code_shape']
+    args.decay = config['rq_model']['decay']
+    args.vq_weight = config['loss_weights']['vq_weight']
+    args.codebook_weight = config['loss_weights']['codebook_weight']
+    args.det_weight = config['loss_weights']['det_weight']
+    args.gpu = config['hardware']['gpu']
+    
+    # Setup model and data using common function
+    (train_dataloader, val_dataloader), headnet, tailnet, device, CLASSES, LABEL2CLASSES, pcd_limit_range = setup_model_and_data(args, mode='train')
+    
+    # Progressive learning configuration
+    embedding_schedule = config['progressive_learning']['embedding_schedule']
+    stage_epochs = config['progressive_learning']['embedding_stage_epochs'] 
+    warmup_epochs = config['progressive_learning']['warmup_epochs']
+    n_codebooks = config['model']['n_codebook']
+    
+    # Setup directories
+    saved_ckpt_path = os.path.join(config['logging']['saved_path'], 'checkpoints')
+    os.makedirs(saved_ckpt_path, exist_ok=True)
+    
+    headnet.eval()
+    tailnet.eval()
+    
+    # Global tracking variables
+    global_best_mAP = 0.0
+    global_best_epoch = 0
+    overall_step = 0
+    
+    loss_func = Loss()
+    
+    print(f"Starting Progressive RQ Training:")
+    print(f"- {n_codebooks} codebooks")
+    print(f"- Embedding schedule: {embedding_schedule}")
+    print(f"- {stage_epochs} epochs per stage, {warmup_epochs} warmup epochs")
+    print(f"Experiment: {exp_name}")
+    print("="*80)
+    
+    # Progressive training: iterate through codebooks
+    for codebook_idx in range(n_codebooks):
+        print(f"\n{'='*60}")
+        print(f"TRAINING CODEBOOK {codebook_idx + 1}/{n_codebooks}")
+        print(f"{'='*60}")
+        
+        # Progressive training: iterate through embedding sizes for current codebook
+        for stage_idx, embed_size in enumerate(embedding_schedule):
+            print(f"\n{'-'*40}")
+            print(f"Codebook {codebook_idx + 1}, Embedding Stage {stage_idx + 1}/{len(embedding_schedule)}: {embed_size} embeddings")
+            print(f"{'-'*40}")
+            
+            # Create RQ bottleneck for this stage
+            stage_args = argparse.Namespace(**vars(args))
+            stage_args.codebook_size = embed_size
+            stage_args.code_shape = config['rq_model']['code_shape'].copy()
+            stage_args.code_shape[-1] = codebook_idx + 1  # Use codebook_idx + 1 codebooks
+            
+            rq_bottleneck = create_rq_bottleneck(stage_args, device, ema=True)
+            
+            # Set training stage: only current codebook is trainable, others frozen or inactive
+            prev_embed_size = embedding_schedule[stage_idx - 1] if stage_idx > 0 else 0
+            full_embed_size = embedding_schedule[-1]
+            rq_bottleneck.set_training_stage(codebook_idx, embed_size, full_embed_size, prev_embed_size)
+            
+            # Setup optimizer and scheduler for this stage
+            init_lr = config['training']['init_lr']
+            
+            # Debug: Check trainable parameters
+            trainable_params = [p for p in rq_bottleneck.parameters() if p.requires_grad]
+            print(f"Debug: Found {len(trainable_params)} trainable parameters")
+            
+            # If no trainable parameters in EMA mode, we'll create optimizer later after switching to gradient mode
+            if len(trainable_params) == 0:
+                print("No trainable parameters found (EMA mode), will create optimizer after warmup")
+                optimizer = None
+                scheduler = None
+            else:
+                optimizer = torch.optim.AdamW(params=trainable_params,
+                                              lr=init_lr,
+                                              betas=(0.9, 0.999),
+                                              weight_decay=0.01)
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=stage_epochs)
+            
+            # Stage training variables
+            stage_best_mAP = 0.0
+            stage_best_epoch = 0
+            train_losses = AverageMeter('TrainLoss', ':.4f')
+            train_det_losses = AverageMeter('TrainDetLoss', ':.4f')
+            train_vq_losses = AverageMeter('TrainVQLoss', ':.6f')
+            train_cb_losses = AverageMeter('TrainCBLoss', ':.6f')
+            
+            early_stopping = EarlyStopping(patience=config['training']['early_stopping_patience'], verbose=True)
+            
+            # Stage training loop
+            for epoch in range(stage_epochs):
+                stage_epoch = epoch + 1
+                global_epoch = codebook_idx * len(embedding_schedule) * stage_epochs + stage_idx * stage_epochs + epoch + 1
+                
+                epoch_start_time = time.time()
+                print(f'\nStage Epoch {stage_epoch}/{stage_epochs} (Global: {global_epoch})')
+                print('-' * 40)
+                
+                # Reset meters
+                train_losses.reset()
+                train_det_losses.reset()
+                train_vq_losses.reset()
+                train_cb_losses.reset()
+                
+                # EMA warmup epochs
+                if epoch < warmup_epochs:
+                    print(f"EMA Warmup Epoch {epoch + 1}/{warmup_epochs}")
+                    rq_bottleneck.train()
+                    
+                    with torch.no_grad():
+                        for i, data_dict in enumerate(tqdm(train_dataloader, desc="EMA Warmup")):
+                            if torch.cuda.is_available():
+                                for key in data_dict:
+                                    for j, item in enumerate(data_dict[key]):
+                                        if torch.is_tensor(item):
+                                            data_dict[key][j] = data_dict[key][j].cuda()
+                            
+                            batched_pts = data_dict['batched_pts']
+                            pillar_features = headnet(batched_pts)
+                            pillar_features_hwc = pillar_features.permute(0, 2, 3, 1)
+                            quantized_features, vq_loss, codebook_loss, codes = rq_bottleneck(pillar_features_hwc)
+                    
+                    # Validation during warmup
+                    print("Running validation during EMA warmup...")
+                    val_metrics = validate_epoch(headnet, tailnet, rq_bottleneck, val_dataloader,
+                                                loss_func, args, CLASSES, LABEL2CLASSES, pcd_limit_range)
+                    
+                    print(f"Warmup Validation Results:")
+                    for key, value in val_metrics.items():
+                        if key.startswith('bbox_3d_'):
+                            print(f"  {key}: {value:.4f}")
+                    
+                    if wandb_run is not None:
+                        wandb.log({
+                            **{f"warmup_val/{key}": value for key, value in val_metrics.items()},
+                            "codebook_idx": codebook_idx,
+                            "stage_idx": stage_idx,
+                            "embed_size": embed_size,
+                            "epoch": global_epoch,
+                        }, step=global_epoch)
+                    
+                    continue
+                
+                # Switch to gradient training after warmup
+                if epoch == warmup_epochs:
+                    print("Switching to gradient-based training")
+                    # Create new RQ model without EMA
+                    new_rq_bottleneck = create_rq_bottleneck(stage_args, device, ema=False)
+                    new_rq_bottleneck.set_training_stage(codebook_idx, embed_size, full_embed_size, prev_embed_size)
+                    
+                    # Transfer EMA weights
+                    with torch.no_grad():
+                        for i, (old_cb, new_cb) in enumerate(zip(rq_bottleneck.codebooks, new_rq_bottleneck.codebooks)):
+                            if hasattr(old_cb, 'sync_ema_weights'):
+                                old_cb.sync_ema_weights()
+                            source_weight = old_cb.weight.detach()
+                            if source_weight.device != new_cb.weight.device:
+                                source_weight = source_weight.to(new_cb.weight.device)
+                            new_cb.weight.data.copy_(source_weight)
+                            new_cb.set_active_n_embed(old_cb.active_n_embed)
+                            new_cb.set_frozen_n_embed(old_cb.frozen_n_embed)
+                    
+                    rq_bottleneck = new_rq_bottleneck
+                    
+                    # Recreate optimizer with gradient-based parameters
+                    trainable_params = [p for p in rq_bottleneck.parameters() if p.requires_grad]
+                    print(f"Debug: Found {len(trainable_params)} trainable parameters after switching to gradient mode")
+                    
+                    if len(trainable_params) == 0:
+                        print("Warning: No trainable parameters found even in gradient mode!")
+                        continue
+                    
+                    optimizer = torch.optim.AdamW(params=trainable_params,
+                                                  lr=init_lr,
+                                                  betas=(0.9, 0.999), 
+                                                  weight_decay=0.01)
+                    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=stage_epochs - warmup_epochs)
+                
+                # Gradient training
+                # Skip gradient training if we're still in warmup epochs or no optimizer
+                if epoch < warmup_epochs or optimizer is None:
+                    continue
+                    
+                rq_bottleneck.train()
+                for i, data_dict in enumerate(tqdm(train_dataloader, desc=f"Training")):
+                    if torch.cuda.is_available():
+                        for key in data_dict:
+                            for j, item in enumerate(data_dict[key]):
+                                if torch.is_tensor(item):
+                                    data_dict[key][j] = data_dict[key][j].cuda()
+                    
+                    if optimizer is not None:
+                        optimizer.zero_grad()
+                    
+                    batched_pts = data_dict['batched_pts']
+                    batched_gt_bboxes = data_dict['batched_gt_bboxes']
+                    batched_labels = data_dict['batched_labels']
+                    
+                    # Forward pass
+                    with torch.no_grad():
+                        pillar_features = headnet(batched_pts)
+                    
+                    pillar_features_hwc = pillar_features.permute(0, 2, 3, 1)
+                    quantized_features, vq_loss, codebook_loss, codes = rq_bottleneck(pillar_features_hwc)
+                    quantized_features = quantized_features.permute(0, 3, 1, 2)
+                    
+                    # Detection loss
+                    bbox_cls_pred, bbox_pred, bbox_dir_cls_pred, anchor_target_dict = tailnet(
+                        quantized_features,
+                        mode='train',
+                        batched_gt_bboxes=batched_gt_bboxes,
+                        batched_gt_labels=batched_labels,
+                        batch_size=len(batched_pts)
+                    )
+                    
+                    # Calculate detection loss (similar to original implementation)
+                    batched_bbox_labels = anchor_target_dict['batched_labels'].reshape(-1)
+                    batched_label_weights = anchor_target_dict['batched_label_weights'].reshape(-1)
+                    batched_bbox_target = anchor_target_dict['batched_bbox_reg'].reshape(-1, 7)
+                    batched_dir_labels = anchor_target_dict['batched_dir_labels'].reshape(-1)
+
+                    bbox_cls_pred_flat = bbox_cls_pred.permute(0, 2, 3, 1).reshape(-1, args.nclasses)
+                    bbox_pred_flat = bbox_pred.permute(0, 2, 3, 1).reshape(-1, 7)
+                    bbox_dir_cls_pred_flat = bbox_dir_cls_pred.permute(0, 2, 3, 1).reshape(-1, 2)
+
+                    pos_mask = (batched_bbox_labels >= 0) & (batched_bbox_labels < args.nclasses)
+                    bbox_pred_pos = bbox_pred_flat[pos_mask]
+                    batched_bbox_reg_pos = batched_bbox_target[pos_mask]
+
+                    if bbox_pred_pos.numel() > 0:
+                        heading_pred = bbox_pred_pos[:, -1].clone()
+                        heading_target = batched_bbox_reg_pos[:, -1].clone()
+                        bbox_pred_pos[:, -1] = torch.sin(heading_pred) * torch.cos(heading_target)
+                        batched_bbox_reg_pos[:, -1] = torch.cos(heading_pred) * torch.sin(heading_target)
+
+                    bbox_dir_cls_pred_pos = bbox_dir_cls_pred_flat[pos_mask]
+                    batched_dir_labels_pos = batched_dir_labels[pos_mask]
+
+                    num_cls_pos = (batched_bbox_labels < args.nclasses).sum()
+                    bbox_cls_pred_valid = bbox_cls_pred_flat[batched_label_weights > 0]
+                    cls_labels = batched_bbox_labels.clone()
+                    cls_labels[cls_labels < 0] = args.nclasses
+                    cls_labels = cls_labels[batched_label_weights > 0]
+
+                    det_loss_dict = loss_func(
+                        bbox_cls_pred=bbox_cls_pred_valid,
+                        bbox_pred=bbox_pred_pos,
+                        bbox_dir_cls_pred=bbox_dir_cls_pred_pos,
+                        batched_labels=cls_labels,
+                        num_cls_pos=num_cls_pos,
+                        batched_bbox_reg=batched_bbox_reg_pos,
+                        batched_dir_labels=batched_dir_labels_pos,
+                    )
+
+                    det_loss = det_loss_dict['total_loss']
+                    
+                    # Total loss
+                    total_loss = (args.vq_weight * vq_loss +
+                                 args.codebook_weight * codebook_loss +
+                                 args.det_weight * det_loss)
+                    
+                    # Update meters
+                    train_losses.update(total_loss.item(), len(batched_pts))
+                    train_det_losses.update(det_loss.item(), len(batched_pts))
+                    train_vq_losses.update(vq_loss.item(), len(batched_pts))
+                    train_cb_losses.update(codebook_loss.item(), len(batched_pts))
+                    
+                    # Backward and optimize
+                    if optimizer is not None and total_loss.requires_grad and total_loss.item() > 0:
+                        total_loss.backward()
+                        torch.nn.utils.clip_grad_norm_(rq_bottleneck.parameters(), max_norm=1.0)
+                        optimizer.step()
+                        if epoch >= warmup_epochs and scheduler is not None:
+                            scheduler.step()
+                    
+                    overall_step += 1
+                    
+                    if wandb_run is not None and config['logging']['log_freq'] > 0 and overall_step % config['logging']['log_freq'] == 0:
+                        log_data = {
+                            'train/total_loss': float(total_loss.item()),
+                            'train/det_loss': float(det_loss.item()),
+                            'train/vq_loss': float(vq_loss.item()),
+                            'train/codebook_loss': float(codebook_loss.item()),
+                            'codebook_idx': codebook_idx,
+                            'stage_idx': stage_idx,
+                            'embed_size': embed_size,
+                            'epoch': global_epoch,
+                        }
+                        if optimizer is not None:
+                            log_data['train/lr'] = optimizer.param_groups[0]['lr']
+                        wandb.log(log_data, step=overall_step)
+                
+                # Validation
+                print(f"Running validation...")
+                val_metrics = validate_epoch(headnet, tailnet, rq_bottleneck, val_dataloader,
+                                            loss_func, args, CLASSES, LABEL2CLASSES, pcd_limit_range)
+                
+                epoch_time = time.time() - epoch_start_time
+                current_mAP = val_metrics.get('overall_mAP', 0.0)
+                
+                # Print results
+                print(f"Stage Epoch {stage_epoch} Summary:")
+                print(f"  Time: {epoch_time:.2f}s")
+                print(f"  Training Loss: {train_losses.avg:.4f}")
+                print(f"  Validation mAP: {current_mAP:.4f}")
+                
+                if wandb_run is not None:
+                    wandb.log({
+                        'epoch': global_epoch,
+                        'stage_epoch': stage_epoch,
+                        'codebook_idx': codebook_idx,
+                        'stage_idx': stage_idx,
+                        'embed_size': embed_size,
+                        'train/epoch_loss': float(train_losses.avg),
+                        **{f'val/{k}': float(v) for k, v in val_metrics.items()},
+                    }, step=overall_step)
+                
+                # Update best metrics
+                is_stage_best = current_mAP > stage_best_mAP
+                is_global_best = current_mAP > global_best_mAP
+                
+                if is_stage_best:
+                    stage_best_mAP = current_mAP
+                    stage_best_epoch = stage_epoch
+                
+                if is_global_best:
+                    global_best_mAP = current_mAP
+                    global_best_epoch = global_epoch
+                
+                # Save checkpoint
+                if stage_epoch % config['training']['ckpt_freq_epoch'] == 0 or is_stage_best or is_global_best:
+                    checkpoint_data = {
+                        'rq_bottleneck': rq_bottleneck.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'scheduler': scheduler.state_dict(),
+                        'epoch': global_epoch,
+                        'stage_epoch': stage_epoch,
+                        'codebook_idx': codebook_idx,
+                        'stage_idx': stage_idx,
+                        'embed_size': embed_size,
+                        'val_metrics': val_metrics,
+                        'config': config
+                    }
+                    
+                    # Regular checkpoint
+                    checkpoint_name = f'codebook_{codebook_idx}_stage_{stage_idx}_epoch_{stage_epoch}.pth'
+                    torch.save(checkpoint_data, os.path.join(saved_ckpt_path, checkpoint_name))
+                    
+                    if is_stage_best:
+                        stage_best_name = f'codebook_{codebook_idx}_stage_{stage_idx}_best.pth'
+                        torch.save(checkpoint_data, os.path.join(saved_ckpt_path, stage_best_name))
+                        print(f"  *** Stage best mAP: {stage_best_mAP:.4f} at epoch {stage_best_epoch} ***")
+                    
+                    if is_global_best:
+                        torch.save(checkpoint_data, os.path.join(saved_ckpt_path, 'global_best.pth'))
+                        print(f"  *** Global best mAP: {global_best_mAP:.4f} at epoch {global_best_epoch} ***")
+                        if wandb_run is not None:
+                            wandb.run.summary['global_best_mAP'] = global_best_mAP
+                            wandb.run.summary['global_best_epoch'] = global_best_epoch
+                
+                # Early stopping check
+                early_stopping(val_metrics['total_loss'], rq_bottleneck)
+                if early_stopping.early_stop:
+                    print(f"Early stopping triggered at stage epoch {stage_epoch}")
+                    break
+            
+            print(f"\nCompleted Codebook {codebook_idx + 1}, Stage {stage_idx + 1}")
+            print(f"Stage best mAP: {stage_best_mAP:.4f}")
+            
+            # Save stage completion checkpoint if enabled
+            if config['logging']['save_stage_weights']:
+                final_stage_checkpoint = {
+                    'rq_bottleneck': rq_bottleneck.state_dict(),
+                    'codebook_idx': codebook_idx,
+                    'stage_idx': stage_idx,
+                    'embed_size': embed_size,
+                    'stage_best_mAP': stage_best_mAP,
+                    'config': config
+                }
+                stage_final_name = f'codebook_{codebook_idx}_stage_{stage_idx}_final.pth'
+                torch.save(final_stage_checkpoint, os.path.join(saved_ckpt_path, stage_final_name))
+    
+    # Training completed
+    print("\n" + "="*80)
+    print("PROGRESSIVE TRAINING COMPLETED!")
+    print("="*80)
+    print(f"Global best validation mAP: {global_best_mAP:.4f} at epoch {global_best_epoch}")
+    print(f"Final experiment: {exp_name}")
+    print("="*80)
+
+    if wandb_run is not None:
+        wandb.run.summary['training_completed'] = True
+        wandb.run.summary['final_global_best_mAP'] = global_best_mAP
+        wandb.run.summary['final_global_best_epoch'] = global_best_epoch
+        wandb.finish()
+    
+    return global_best_mAP, global_best_epoch
+
+
 def train_rq(args):
     """Train RQ model using refactored common setup"""
     # Setup experiment name and date
@@ -932,6 +1360,73 @@ def load_rq_checkpoint(rq_bottleneck, checkpoint_path, device):
         print(f"Loaded RQ checkpoint from {checkpoint_path}")
     return rq_bottleneck
 
+def evaluate_progressive_rq(config):
+    """Evaluation function with progressive RQ configuration support"""
+    # Convert config to args-like object for compatibility
+    args = argparse.Namespace()
+    args.data_root = config['dataset']['dir']
+    args.pretrained_ckpt = config['model']['pretrained_weight']
+    args.batch_size = config['training']['batch_size']
+    args.num_workers = config['training']['num_workers']
+    args.nclasses = config['dataset']['num_classes']
+    args.latent_shape = config['rq_model']['latent_shape']
+    args.code_shape = config['rq_model']['code_shape']
+    args.decay = config['rq_model']['decay']
+    args.gpu = config['hardware']['gpu']
+    
+    # Setup model and data
+    val_dataloader, headnet, tailnet, device, CLASSES, LABEL2CLASSES, pcd_limit_range = setup_model_and_data(args, mode='eval')
+    
+    # Create RQ bottleneck based on evaluation configuration
+    rq_bottleneck = None
+    if config['evaluation']['rq_ckpt'] is not None:
+        eval_config = config['evaluation']
+        use_num_codebooks = eval_config['use_num_codebook']
+        use_num_embeddings = eval_config['use_num_embedding']
+        
+        print(f"Evaluation Configuration:")
+        print(f"- Using {use_num_codebooks} codebook(s)")
+        print(f"- Using {use_num_embeddings} embedding(s) per codebook")
+        print(f"- Loading checkpoint: {eval_config['rq_ckpt']}")
+        
+        # Create RQ bottleneck with evaluation configuration
+        eval_args = argparse.Namespace(**vars(args))
+        eval_args.codebook_size = use_num_embeddings
+        eval_args.code_shape = config['rq_model']['code_shape'].copy()
+        eval_args.code_shape[-1] = use_num_codebooks
+        
+        rq_bottleneck = create_rq_bottleneck(eval_args, device, ema=False)
+        rq_bottleneck.set_evaluation_stage(use_num_codebooks, use_num_embeddings)
+        rq_bottleneck = load_rq_checkpoint(rq_bottleneck, eval_config['rq_ckpt'], device)
+    
+    # Run evaluation
+    loss_func = Loss()
+    eval_metrics = validate_epoch(headnet, tailnet, rq_bottleneck, val_dataloader,
+                                loss_func, args, CLASSES, LABEL2CLASSES, pcd_limit_range)
+    
+    # Print results
+    print("\n" + "="*60)
+    print("PROGRESSIVE RQ EVALUATION RESULTS")
+    print("="*60)
+    for key, value in eval_metrics.items():
+        print(f"{key:30s}: {value:8.4f}")
+    print("="*60)
+    
+    return eval_metrics
+
+
+def load_config(config_path):
+    """Load configuration from YAML file"""
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Configuration file not found: {config_path}")
+    
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    
+    print(f"Loaded configuration from: {config_path}")
+    return config
+
+
 def evaluate_rq(args):
     """Simplified evaluation function using common setup"""
     # Setup model and data
@@ -959,56 +1454,130 @@ def evaluate_rq(args):
     return eval_metrics
 
 def main():
-    parser = argparse.ArgumentParser(description='RQ Training and Evaluation')
-    parser.add_argument('--mode', choices=['train', 'eval'], default='train',
-                        help='Mode: train or eval')
-    parser.add_argument('--data_root', default='/home/yenhsiu/datasets', 
-                        help='your data root for kitti')
-    parser.add_argument('--pretrained_ckpt', default='pretrained/epoch_160.pth',
-                        help='pretrained PointPillars checkpoint')
-    parser.add_argument('--rq_ckpt', help='RQ checkpoint for evaluation')
-    parser.add_argument('--use_rq', action='store_true', help='use RQ in evaluation')
-    parser.add_argument('--saved_path', default='test_rq_logs_unified_clean')
-    parser.add_argument('--batch_size', type=int, default=6)
-    parser.add_argument('--num_workers', type=int, default=4)
-    parser.add_argument('--nclasses', type=int, default=3)
-    parser.add_argument('--init_lr', type=float, default=0.001)
-    parser.add_argument('--max_epoch', type=int, default=100)
-    parser.add_argument('--ckpt_freq_epoch', type=int, default=20)
-    parser.add_argument('--patience', type=int, default=5, help='early stopping patience')
-    parser.add_argument('--log_freq', type=int, default=8,
-                        help='number of optimizer steps between wandb training logs')
-    parser.add_argument('--use_wandb', action='store_true', default=True,
-                        help='enable Weights & Biases logging (enabled by default)')
+    parser = argparse.ArgumentParser(description='Progressive RQ Training and Evaluation')
+    
+    # Main configuration
+    parser.add_argument('--config', type=str, default='exp/split1_ALL.yaml',
+                        help='Path to YAML configuration file')
+    parser.add_argument('--mode', choices=['train', 'eval'], default=None,
+                        help='Mode: train or eval (overrides config)')
+    
+    # Optional overrides (will override config values if provided)
+    parser.add_argument('--data_root', type=str, default=None,
+                        help='Override data root path')
+    parser.add_argument('--pretrained_ckpt', type=str, default=None,
+                        help='Override pretrained checkpoint path')
+    parser.add_argument('--rq_ckpt', type=str, default=None,
+                        help='Override RQ checkpoint for evaluation')
+    parser.add_argument('--gpu', type=int, default=None,
+                        help='Override GPU device id')
+    parser.add_argument('--batch_size', type=int, default=None,
+                        help='Override batch size')
+    parser.add_argument('--use_wandb', action='store_true', default=None,
+                        help='Override wandb usage')
     parser.add_argument('--no_wandb', action='store_false', dest='use_wandb',
-                        help='disable Weights & Biases logging')
-    parser.add_argument('--wandb_project', default='pointpillars-rq',
-                        help='Weights & Biases project name')
-    parser.add_argument('--wandb_name', default=None,
-                        help='Weights & Biases run name (auto-generated if omitted)')
-    parser.add_argument('--gpu', type=int, default=0,
-                        help='CUDA device id(s) to use, e.g., "0" or "0,1"')
+                        help='Disable wandb logging')
     
-    # RQ parameters
-    parser.add_argument('--latent_shape', nargs=3, type=int, default=[496, 432, 64], 
-                        help='latent shape [h, w, c]')
-    parser.add_argument('--code_shape', nargs=3, type=int, default=[496, 432, 1], 
-                        help='code shape [h, w, num_codebooks] - must divide latent_shape evenly')
-    parser.add_argument('--codebook_size', type=int, default=64, help='size of codebook')
-    parser.add_argument('--decay', type=float, default=0.99, help='EMA decay for codebook')
-    
-    # Loss weights  
-    parser.add_argument('--vq_weight', type=float, default=0.25, help='weight for VQ loss')
-    parser.add_argument('--codebook_weight', type=float, default=0.1, help='weight for codebook loss')
-    parser.add_argument('--det_weight', type=float, default=0.8, help='weight for detection loss')
+    # Evaluation specific overrides
+    parser.add_argument('--eval_num_codebooks', type=int, default=None,
+                        help='Number of codebooks to use for evaluation')
+    parser.add_argument('--eval_num_embeddings', type=int, default=None,
+                        help='Number of embeddings per codebook for evaluation')
     
     args = parser.parse_args()
-    torch.cuda.set_device(args.gpu)
-
-    if args.mode == 'train':
-        train_rq(args)
+    
+    # Load configuration from YAML
+    try:
+        config = load_config(args.config)
+    except FileNotFoundError:
+        print(f"Error: Configuration file '{args.config}' not found.")
+        print("Please ensure the config file exists or specify a different path with --config")
+        return
+    
+    # Apply command line overrides
+    if args.mode is not None:
+        config['training']['mode'] = args.mode
+    if args.data_root is not None:
+        config['dataset']['dir'] = args.data_root
+    if args.pretrained_ckpt is not None:
+        config['model']['pretrained_weight'] = args.pretrained_ckpt
+    if args.rq_ckpt is not None:
+        config['evaluation']['rq_ckpt'] = args.rq_ckpt
+    if args.gpu is not None:
+        config['hardware']['gpu'] = args.gpu
+    if args.batch_size is not None:
+        config['training']['batch_size'] = args.batch_size
+    if args.use_wandb is not None:
+        config['logging']['use_wandb'] = args.use_wandb
+    if args.eval_num_codebooks is not None:
+        config['evaluation']['use_num_codebook'] = args.eval_num_codebooks
+    if args.eval_num_embeddings is not None:
+        config['evaluation']['use_num_embedding'] = args.eval_num_embeddings
+    
+    # Set GPU device
+    torch.cuda.set_device(config['hardware']['gpu'])
+    
+    # Print configuration summary
+    print("\n" + "="*60)
+    print("CONFIGURATION SUMMARY")
+    print("="*60)
+    print(f"Mode: {config['training']['mode']}")
+    print(f"Dataset: {config['dataset']['name']}")
+    print(f"Data root: {config['dataset']['dir']}")
+    print(f"Model: {config['model']['pre_trained_model']}")
+    print(f"GPU: {config['hardware']['gpu']}")
+    print(f"Batch size: {config['training']['batch_size']}")
+    
+    if config['progressive_learning']['enabled']:
+        print(f"Progressive learning: Enabled")
+        print(f"- {config['model']['n_codebook']} codebooks")
+        print(f"- Embedding schedule: {config['progressive_learning']['embedding_schedule']}")
+        print(f"- {config['progressive_learning']['embedding_stage_epochs']} epochs per stage")
     else:
-        evaluate_rq(args)
+        print("Progressive learning: Disabled")
+    
+    if config['training']['mode'] == 'eval':
+        print(f"Evaluation:")
+        print(f"- Using {config['evaluation']['use_num_codebook']} codebook(s)")
+        print(f"- Using {config['evaluation']['use_num_embedding']} embedding(s)")
+        if config['evaluation']['rq_ckpt']:
+            print(f"- Checkpoint: {config['evaluation']['rq_ckpt']}")
+    
+    print("="*60)
+    
+    # Run training or evaluation
+    if config['training']['mode'] == 'train':
+        if config['progressive_learning']['enabled']:
+            train_progressive_rq(config)
+        else:
+            # Convert config to args for legacy function
+            args_legacy = argparse.Namespace()
+            args_legacy.data_root = config['dataset']['dir']
+            args_legacy.pretrained_ckpt = config['model']['pretrained_weight']
+            args_legacy.batch_size = config['training']['batch_size']
+            args_legacy.num_workers = config['training']['num_workers']
+            args_legacy.nclasses = config['dataset']['num_classes']
+            args_legacy.init_lr = config['training']['init_lr']
+            args_legacy.max_epoch = config['training']['max_epoch']
+            args_legacy.ckpt_freq_epoch = config['training']['ckpt_freq_epoch']
+            args_legacy.patience = config['training']['patience']
+            args_legacy.log_freq = config['logging']['log_freq']
+            args_legacy.use_wandb = config['logging']['use_wandb']
+            args_legacy.wandb_project = config['logging']['wandb_project']
+            args_legacy.wandb_name = config['logging']['wandb_name']
+            args_legacy.gpu = config['hardware']['gpu']
+            args_legacy.latent_shape = config['rq_model']['latent_shape']
+            args_legacy.code_shape = config['rq_model']['code_shape']
+            args_legacy.codebook_size = config['rq_model']['codebook_size']
+            args_legacy.decay = config['rq_model']['decay']
+            args_legacy.vq_weight = config['loss_weights']['vq_weight']
+            args_legacy.codebook_weight = config['loss_weights']['codebook_weight']
+            args_legacy.det_weight = config['loss_weights']['det_weight']
+            args_legacy.saved_path = config['logging']['saved_path']
+            train_rq(args_legacy)
+    else:
+        evaluate_progressive_rq(config)
+
 
 if __name__ == '__main__':
     main()
