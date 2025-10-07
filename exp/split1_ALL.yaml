@@ -9,7 +9,7 @@ dataset:
 # Model configuration
 model:
   pre_trained_model: "b0"
-  n_codebook: 5
+  n_codebook: 2
   pretrained_weight: 'pretrained/epoch_160.pth'
   
 # Progressive learning configuration

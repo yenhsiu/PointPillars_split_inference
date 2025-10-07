@@ -91,12 +91,12 @@ def get_score_thresholds(tp_scores, total_num_valid_gt, num_sample_pts=41):
     return score_thresholds
 
 def do_eval(det_results, gt_results, CLASSES, saved_path, eval_types=(
-    'bbox_3d',), difficulties=(0, 1, 2)):
+    'bbox_2d', 'bbox_bev', 'bbox_3d'), difficulties=(0, 1, 2)):
     """
     Complete KITTI evaluation protocol with selectable eval types.
-    Only keys from eval_types will be computed and returned.
+    Supports bbox_2d, bbox_bev, bbox_3d evaluation types.
     """
-    # Restrict to requested eval types; default to bbox_3d only
+    # Include all requested eval types
     EVAL_NAMES = list(eval_types)
     # Determine class names regardless of CLASSES being dict(int->name), dict(name->int), or list[str]
     if isinstance(CLASSES, dict):
@@ -275,23 +275,42 @@ def do_eval(det_results, gt_results, CLASSES, saved_path, eval_types=(
                 
                 eval_ap_results[eval_type][f'difficulty_{difficulty}'][cls_name] = mAP
 
-    # Calculate overall metrics
+    # Calculate overall metrics with detailed class breakdown
     overall_metrics = {}
     collected_keys = []
+    
+    # Add detailed per-class per-difficulty metrics
     for eval_type in EVAL_NAMES:
         for difficulty in list(difficulties):
             difficulty_key = f'difficulty_{difficulty}'
+            difficulty_name = ['Easy', 'Moderate', 'Hard'][difficulty] if difficulty < 3 else f'Diff_{difficulty}'
+            
+            # Per-class mAP
+            for cls_name in class_names:
+                cls_mAP = eval_ap_results[eval_type][difficulty_key].get(cls_name, 0.0)
+                key = f'{eval_type}_{difficulty_key}_{cls_name}_mAP'
+                overall_metrics[key] = float(cls_mAP)
+                # Also add human-readable format
+                human_key = f'{eval_type}_{difficulty_name}_{cls_name}_mAP'
+                overall_metrics[human_key] = float(cls_mAP)
+            
+            # Average mAP for this difficulty
             mAPs = [eval_ap_results[eval_type][difficulty_key].get(cls_name, 0.0) 
                    for cls_name in class_names]
             key = f'{eval_type}_{difficulty_key}_mAP'
-            overall_metrics[key] = float(np.mean(mAPs)) if len(mAPs) > 0 else 0.0
+            avg_mAP = float(np.mean(mAPs)) if len(mAPs) > 0 else 0.0
+            overall_metrics[key] = avg_mAP
+            # Also add human-readable format
+            human_key = f'{eval_type}_{difficulty_name}_mAP'
+            overall_metrics[human_key] = avg_mAP
             collected_keys.append(key)
+    
     # Define overall_mAP as the mean of the selected mAPs
     overall_metrics['overall_mAP'] = float(np.mean([overall_metrics[k] for k in collected_keys])) if collected_keys else 0.0
     return overall_metrics
 
 def validate_epoch(headnet, tailnet, rq_bottleneck, val_dataloader, loss_func, args, CLASSES, LABEL2CLASSES, pcd_limit_range,
-                   eval_types=('bbox_3d',), difficulties=(0, 1, 2), max_batches=None):
+                   eval_types=('bbox_2d', 'bbox_bev', 'bbox_3d'), difficulties=(0, 1, 2), max_batches=None):
     """
     Run validation for one epoch and return metrics
     """
@@ -602,9 +621,14 @@ def train_progressive_rq(config):
             rq_bottleneck = create_rq_bottleneck(stage_args, device, ema=True)
             
             # Set training stage: only current codebook is trainable, others frozen or inactive
-            prev_embed_size = embedding_schedule[stage_idx - 1] if stage_idx > 0 else 0
+            # For incremental training: freeze embeddings trained in previous stages
+            frozen_embed_size = embedding_schedule[stage_idx - 1] if stage_idx > 0 else 0
             full_embed_size = embedding_schedule[-1]
-            rq_bottleneck.set_training_stage(codebook_idx, embed_size, full_embed_size, prev_embed_size)
+            rq_bottleneck.set_training_stage(codebook_idx, embed_size, full_embed_size, frozen_embed_size)
+            
+            print(f"Training stage setup:")
+            print(f"  Codebook {codebook_idx}: active_n_embed={embed_size}, frozen_n_embed={frozen_embed_size}")
+            print(f"  Training range: embeddings {frozen_embed_size} to {embed_size-1}")
             
             # Setup optimizer and scheduler for this stage
             init_lr = config['training']['init_lr']
@@ -674,18 +698,36 @@ def train_progressive_rq(config):
                                                 loss_func, args, CLASSES, LABEL2CLASSES, pcd_limit_range)
                     
                     print(f"Warmup Validation Results:")
+                    # Print only bbox_3d metrics for console
+                    bbox_3d_overall = (val_metrics.get('bbox_3d_difficulty_0_mAP', 0.0) + 
+                                      val_metrics.get('bbox_3d_difficulty_1_mAP', 0.0) + 
+                                      val_metrics.get('bbox_3d_difficulty_2_mAP', 0.0)) / 3.0
+                    print(f"  Overall bbox_3d mAP: {bbox_3d_overall:.4f}")
                     for key, value in val_metrics.items():
-                        if key.startswith('bbox_3d_'):
+                        if key.startswith('bbox_3d_difficulty_') and not any(cls in key for cls in ['Car', 'Pedestrian', 'Cyclist']):
                             print(f"  {key}: {value:.4f}")
+                    print(f"  Loss - Total: {val_metrics.get('total_loss', 0.0):.4f}, Det: {val_metrics.get('det_loss', 0.0):.4f}, VQ: {val_metrics.get('vq_loss', 0.0):.6f}")
                     
                     if wandb_run is not None:
-                        wandb.log({
-                            **{f"warmup_val/{key}": value for key, value in val_metrics.items()},
+                        # 建立詳細的warmup wandb log - 記錄所有指標
+                        warmup_log_data = {
                             "codebook_idx": codebook_idx,
                             "stage_idx": stage_idx,
                             "embed_size": embed_size,
                             "epoch": global_epoch,
-                        }, step=global_epoch)
+                            # Loss metrics
+                            "warmup_val/total_loss": float(val_metrics.get('total_loss', 0.0)),
+                            "warmup_val/det_loss": float(val_metrics.get('det_loss', 0.0)),
+                            "warmup_val/vq_loss": float(val_metrics.get('vq_loss', 0.0)),
+                            "warmup_val/cb_loss": float(val_metrics.get('cb_loss', 0.0)),
+                        }
+                        
+                        # 記錄所有評估指標到wandb
+                        for key, value in val_metrics.items():
+                            if any(key.startswith(eval_type) for eval_type in ['bbox_2d', 'bbox_bev', 'bbox_3d']) or key == 'overall_mAP':
+                                warmup_log_data[f"warmup_val/{key}"] = float(value)
+                        
+                        wandb.log(warmup_log_data, step=global_epoch)
                     
                     continue
                 
@@ -694,7 +736,7 @@ def train_progressive_rq(config):
                     print("Switching to gradient-based training")
                     # Create new RQ model without EMA
                     new_rq_bottleneck = create_rq_bottleneck(stage_args, device, ema=False)
-                    new_rq_bottleneck.set_training_stage(codebook_idx, embed_size, full_embed_size, prev_embed_size)
+                    new_rq_bottleneck.set_training_stage(codebook_idx, embed_size, full_embed_size, frozen_embed_size)
                     
                     # Transfer EMA weights
                     with torch.no_grad():
@@ -844,24 +886,51 @@ def train_progressive_rq(config):
                                             loss_func, args, CLASSES, LABEL2CLASSES, pcd_limit_range)
                 
                 epoch_time = time.time() - epoch_start_time
-                current_mAP = val_metrics.get('overall_mAP', 0.0)
+                # 使用bbox_3d overall mAP作為主要指標
+                current_mAP = (val_metrics.get('bbox_3d_difficulty_0_mAP', 0.0) + 
+                              val_metrics.get('bbox_3d_difficulty_1_mAP', 0.0) + 
+                              val_metrics.get('bbox_3d_difficulty_2_mAP', 0.0)) / 3.0
                 
-                # Print results
+                # Print results - 只顯示bbox_3d相關指標
+                bbox_3d_overall = (val_metrics.get('bbox_3d_difficulty_0_mAP', 0.0) + 
+                                  val_metrics.get('bbox_3d_difficulty_1_mAP', 0.0) + 
+                                  val_metrics.get('bbox_3d_difficulty_2_mAP', 0.0)) / 3.0
                 print(f"Stage Epoch {stage_epoch} Summary:")
                 print(f"  Time: {epoch_time:.2f}s")
-                print(f"  Training Loss: {train_losses.avg:.4f}")
-                print(f"  Validation mAP: {current_mAP:.4f}")
+                print(f"  Training Loss: {train_losses.avg:.4f} (Det: {train_det_losses.avg:.4f}, VQ: {train_vq_losses.avg:.6f}, CB: {train_cb_losses.avg:.6f})")
+                print(f"  Validation Results (bbox_3d only):")
+                print(f"    Overall bbox_3d mAP: {bbox_3d_overall:.4f}")
+                for key, value in val_metrics.items():
+                    if key.startswith('bbox_3d_difficulty_') and not any(cls in key for cls in ['Car', 'Pedestrian', 'Cyclist']):
+                        print(f"    {key}: {value:.4f}")
+                print(f"    Loss - Total: {val_metrics.get('total_loss', 0.0):.4f}, Det: {val_metrics.get('det_loss', 0.0):.4f}")
                 
                 if wandb_run is not None:
-                    wandb.log({
+                    # 建立詳細的wandb log - 記錄所有指標
+                    wandb_log_data = {
                         'epoch': global_epoch,
                         'stage_epoch': stage_epoch,
                         'codebook_idx': codebook_idx,
                         'stage_idx': stage_idx,
                         'embed_size': embed_size,
-                        'train/epoch_loss': float(train_losses.avg),
-                        **{f'val/{k}': float(v) for k, v in val_metrics.items()},
-                    }, step=overall_step)
+                        # Training metrics
+                        'train/total_loss': float(train_losses.avg),
+                        'train/det_loss': float(train_det_losses.avg),
+                        'train/vq_loss': float(train_vq_losses.avg),
+                        'train/codebook_loss': float(train_cb_losses.avg),
+                        # Loss metrics
+                        'val/total_loss': float(val_metrics.get('total_loss', 0.0)),
+                        'val/det_loss': float(val_metrics.get('det_loss', 0.0)),
+                        'val/vq_loss': float(val_metrics.get('vq_loss', 0.0)),
+                        'val/cb_loss': float(val_metrics.get('cb_loss', 0.0)),
+                    }
+                    
+                    # 記錄所有評估指標到wandb（bbox_2d, bbox_bev, bbox_3d）
+                    for key, value in val_metrics.items():
+                        if any(key.startswith(eval_type) for eval_type in ['bbox_2d', 'bbox_bev', 'bbox_3d']) or key == 'overall_mAP':
+                            wandb_log_data[f'val/{key}'] = float(value)
+                    
+                    wandb.log(wandb_log_data, step=overall_step)
                 
                 # Update best metrics
                 is_stage_best = current_mAP > stage_best_mAP
@@ -875,12 +944,12 @@ def train_progressive_rq(config):
                     global_best_mAP = current_mAP
                     global_best_epoch = global_epoch
                 
-                # Save checkpoint
-                if stage_epoch % config['training']['ckpt_freq_epoch'] == 0 or is_stage_best or is_global_best:
+                # Save checkpoint - 只在最佳結果時儲存
+                if is_stage_best or is_global_best:
                     checkpoint_data = {
                         'rq_bottleneck': rq_bottleneck.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'scheduler': scheduler.state_dict(),
+                        'optimizer': optimizer.state_dict() if optimizer is not None else None,
+                        'scheduler': scheduler.state_dict() if scheduler is not None else None,
                         'epoch': global_epoch,
                         'stage_epoch': stage_epoch,
                         'codebook_idx': codebook_idx,
@@ -890,20 +959,16 @@ def train_progressive_rq(config):
                         'config': config
                     }
                     
-                    # Regular checkpoint
-                    checkpoint_name = f'codebook_{codebook_idx}_stage_{stage_idx}_epoch_{stage_epoch}.pth'
-                    torch.save(checkpoint_data, os.path.join(saved_ckpt_path, checkpoint_name))
-                    
                     if is_stage_best:
                         stage_best_name = f'codebook_{codebook_idx}_stage_{stage_idx}_best.pth'
                         torch.save(checkpoint_data, os.path.join(saved_ckpt_path, stage_best_name))
-                        print(f"  *** Stage best mAP: {stage_best_mAP:.4f} at epoch {stage_best_epoch} ***")
+                        print(f"  *** Stage best bbox_3d mAP: {stage_best_mAP:.4f} at epoch {stage_best_epoch} ***")
                     
                     if is_global_best:
                         torch.save(checkpoint_data, os.path.join(saved_ckpt_path, 'global_best.pth'))
-                        print(f"  *** Global best mAP: {global_best_mAP:.4f} at epoch {global_best_epoch} ***")
+                        print(f"  *** Global best bbox_3d mAP: {global_best_mAP:.4f} at epoch {global_best_epoch} ***")
                         if wandb_run is not None:
-                            wandb.run.summary['global_best_mAP'] = global_best_mAP
+                            wandb.run.summary['global_best_bbox_3d_mAP'] = global_best_mAP
                             wandb.run.summary['global_best_epoch'] = global_best_epoch
                 
                 # Early stopping check
@@ -913,7 +978,27 @@ def train_progressive_rq(config):
                     break
             
             print(f"\nCompleted Codebook {codebook_idx + 1}, Stage {stage_idx + 1}")
-            print(f"Stage best mAP: {stage_best_mAP:.4f}")
+            print(f"Stage best bbox_3d mAP: {stage_best_mAP:.4f}")
+            
+            # Record stage completion to wandb with detailed metrics
+            if wandb_run is not None:
+                # 運行最終驗證以獲取完整指標
+                final_val_metrics = validate_epoch(headnet, tailnet, rq_bottleneck, val_dataloader,
+                                                  loss_func, args, CLASSES, LABEL2CLASSES, pcd_limit_range)
+                
+                stage_completion_data = {
+                    f'stage_completion/codebook_{codebook_idx}_stage_{stage_idx}_best_bbox_3d_mAP': stage_best_mAP,
+                    f'stage_completion/codebook_{codebook_idx}_stage_{stage_idx}_embed_size': embed_size,
+                    f'stage_completion/codebook_{codebook_idx}_stage_{stage_idx}_global_epoch': global_epoch,
+                }
+                
+                # 記錄最終所有指標
+                for key, value in final_val_metrics.items():
+                    if any(key.startswith(eval_type) for eval_type in ['bbox_2d', 'bbox_bev', 'bbox_3d']) or key == 'overall_mAP':
+                        stage_completion_data[f'stage_completion/codebook_{codebook_idx}_stage_{stage_idx}_{key}'] = float(value)
+                
+                wandb.log(stage_completion_data, step=global_epoch)
+                print(f"  Logged stage completion metrics to wandb")
             
             # Save stage completion checkpoint if enabled
             if config['logging']['save_stage_weights']:
@@ -1408,8 +1493,35 @@ def evaluate_progressive_rq(config):
     print("\n" + "="*60)
     print("PROGRESSIVE RQ EVALUATION RESULTS")
     print("="*60)
-    for key, value in eval_metrics.items():
-        print(f"{key:30s}: {value:8.4f}")
+    
+    # Overall metrics
+    print(f"Overall mAP: {eval_metrics.get('overall_mAP', 0.0):8.4f}")
+    print("-" * 40)
+    
+    # Detailed breakdown by difficulty and class
+    difficulties_names = ['Easy', 'Moderate', 'Hard']
+    class_names = ['Car', 'Pedestrian', 'Cyclist']
+    
+    for i, diff_name in enumerate(difficulties_names):
+        print(f"{diff_name} Difficulty:")
+        for cls_name in class_names:
+            key = f'bbox_3d_difficulty_{i}_{cls_name}_mAP'
+            if key in eval_metrics:
+                print(f"  {cls_name:12s}: {eval_metrics[key]:8.4f}")
+        
+        # Difficulty average
+        diff_avg_key = f'bbox_3d_difficulty_{i}_mAP'
+        if diff_avg_key in eval_metrics:
+            print(f"  {'Average':12s}: {eval_metrics[diff_avg_key]:8.4f}")
+        print()
+    
+    # Loss information
+    print("Loss Information:")
+    print(f"  {'Total Loss':12s}: {eval_metrics.get('total_loss', 0.0):8.4f}")
+    print(f"  {'Det Loss':12s}: {eval_metrics.get('det_loss', 0.0):8.4f}")
+    print(f"  {'VQ Loss':12s}: {eval_metrics.get('vq_loss', 0.0):8.6f}")
+    print(f"  {'CB Loss':12s}: {eval_metrics.get('cb_loss', 0.0):8.6f}")
+    
     print("="*60)
     
     return eval_metrics
