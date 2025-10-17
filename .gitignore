@@ -6,6 +6,13 @@ build/
 tmp/
 results/
 *.sh
+*.txt
 .idea
 wandb/
 *.pth
+/model_quantizer/venv_converter
+*.pb
+*.onnx
+saved_model/
+saved_model_int8/
+tflite_results/
