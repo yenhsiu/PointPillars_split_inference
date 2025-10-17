@@ -1581,7 +1581,7 @@ def main():
                         help='Override pretrained checkpoint path')
     parser.add_argument('--rq_ckpt', type=str, default=None,
                         help='Override RQ checkpoint for evaluation')
-    parser.add_argument('--gpu', type=int, default=None,
+    parser.add_argument('--gpu', type=int, default=3,
                         help='Override GPU device id')
     parser.add_argument('--batch_size', type=int, default=None,
                         help='Override batch size')
