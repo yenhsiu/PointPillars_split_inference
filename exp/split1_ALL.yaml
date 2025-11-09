@@ -8,7 +8,6 @@ dataset:
 
 # Model configuration
 model:
-  pre_trained_model: "b0"
   n_codebook: 2
   pretrained_weight: 'pretrained/epoch_160.pth'
   
@@ -52,11 +51,11 @@ evaluation:
   
 # Logging and saving
 logging:
-  use_wandb: True
+  use_wandb: False
   wandb_project: "pointpillars-rq-progressive"
   wandb_name: null
   log_freq: 8
-  saved_path: "progressive_rq_logs"
+  saved_path: "progressive_rq_logs(1,1))"
   save_stage_weights: True
   
 # Hardware

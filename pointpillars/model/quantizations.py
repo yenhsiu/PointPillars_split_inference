@@ -78,9 +78,28 @@ class VQEmbedding(nn.Embedding):
 
     def set_frozen_n_embed(self, n):
         self.frozen_n_embed = n
+        # Save frozen weights for protection
+        if n > 0:
+            self.original_frozen_weights = self.weight[:n].detach().clone()
 
     def set_active_n_embed(self, n):
         self.active_n_embed = n
+        
+    @torch.no_grad()
+    def _protect_frozen_weights(self):
+        """
+        Ensures frozen weights cannot be modified directly.
+        Call this method after any potential direct weight modification.
+        This is a safety mechanism to prevent accidental modifications.
+        """
+        if hasattr(self, 'original_frozen_weights'):
+            # Restore frozen weights if they were saved
+            if self.frozen_n_embed > 0:
+                self.weight.data[:self.frozen_n_embed] = self.original_frozen_weights
+        else:
+            # Save original frozen weights for future protection
+            if self.frozen_n_embed > 0:
+                self.original_frozen_weights = self.weight[:self.frozen_n_embed].detach().clone()
 
     @torch.no_grad()
     def compute_distances(self, inputs):
@@ -266,11 +285,16 @@ class VQEmbedding(nn.Embedding):
         if self.training and self._use_ema and self._trainable:
             self._update_buffers(inputs, embed_idxs)
         
+        # 確保凍結權重在任何情況下不被修改
+        self._protect_frozen_weights()
+        
         embeds = self.embed(embed_idxs)
         
         # 【修正】按照官方邏輯，在 embed 之後更新 embedding
         if self.training and self._use_ema and self._trainable:
             self._update_embedding()
+            # 再次確保凍結權重不被修改
+            self._protect_frozen_weights()
             
         return embeds, embed_idxs
 

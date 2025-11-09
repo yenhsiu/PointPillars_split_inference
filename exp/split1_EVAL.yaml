@@ -1,0 +1,32 @@
+seed: 42
+pre-trained_model: "b0"
+
+dataset:
+  name: KITTI
+  dir: "/home/yenhsiu/datasets"
+  num_classes: 3
+  
+model:
+  n_codebook: 2  # 需要評估的codebook數量 (根據訓練設置)
+  pretrained_weight: 'pretrained/epoch_160.pth'
+
+# Hardware
+hardware:
+  gpu: 2
+
+wandb: false  # 關閉 W&B 加速測試
+hyperparameters:
+  batch_size: 6
+  embedding_schedule: [16, 32, 64, 128, 256]  # 必須與訓練時一致！
+
+# ===== 評估模式配置 =====
+evaluation:
+  enabled: True  # 啟用評估模式
+  weights_path: './checkpoints/global_final.pth'  # 使用我們的全局檢查點
+  use_num_codebook: 2  # 使用2個codebook
+  use_num_embedding: 32  # 使用32個嵌入（最大值）
+  eval_all_codebook_stages: false  # 只評估全局模型
+  use_final_checkpoints_only: true  # 使用final檢查點
+  use_last_stage_for_all: false  # 不需要，我們有全局檢查點
+  visualize_codebook_hierarchy: False  # 是否生成視覺化圖表
+  
