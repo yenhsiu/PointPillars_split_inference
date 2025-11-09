@@ -8,40 +8,48 @@ dataset:
 
 # Model configuration
 model:
-  pre_trained_model: "b0"
-  n_codebook: 2
+  n_codebook: 3
   pretrained_weight: 'pretrained/epoch_160.pth'
   
 # Progressive learning configuration
 progressive_learning:
   enabled: True
-  embedding_schedule: [16, 32, 64, 128, 256]  # embedding size schedule
-  embedding_stage_epochs: 20  # epochs per embedding stage
-  warmup_epochs: 2  # EMA warmup epochs per stage
+  embedding_schedule: [16, 32, 64]  # embedding size schedule
+  embedding_stage_epochs: 3  # epochs per embedding stage
+  warmup_epochs: 1  # EMA warmup epochs per stage
+  pretrain_ema_limit: None  # Optional: limit EMA warmup samples
   
 # Training hyperparameters
 training:
   mode: 'train'  # 'train' or 'eval'
-  batch_size: 6
+  batch_size: 12
   num_workers: 4
   max_epoch: 100  # total epochs (will be divided across stages in progressive mode)
-  init_lr: 0.001
+  init_lr: 0.0005
   ckpt_freq_epoch: 20
-  patience: 5
+  patience: 3
   early_stopping_patience: 5
   
 # RQ model parameters
 rq_model:
   latent_shape: [496, 432, 64]
-  code_shape: [496, 432, 1] 
-  codebook_size: 64  # will be overridden by progressive schedule
+  code_shape: [496, 432, 3]  # Last dimension = number of codebooks
+  codebook_size: 256  # Must be >= max(embedding_schedule)
   decay: 0.99
+  codebook_update_mode: 'LOSS'  # Training mode: 'LOSS' or 'EMA'
   
-# Loss weights
+# Loss weights (with automatic normalization)
+# Detection loss is normalized by dividing by 100 to match VQ scale
+# Formula: loss = det_weight*(det_loss/100) + vq_weight*vq_loss
+# NOTE: codebook_weight is IGNORED (codebook_loss has no gradient in current implementation)
 loss_weights:
-  vq_weight: 0.25
-  codebook_weight: 0.1
-  det_weight: 0.8
+  det_weight: 10         # Detection task performance (normalized, range ~1-10)
+  vq_weight: 1.0          # Reconstruction quality / quantization error (range ~0.1-10)
+  codebook_weight: 0.0    # NO EFFECT - kept for compatibility but not used
+  # Recommended settings:
+  # - Balanced: det_weight=1.0, vq_weight=1.0 (50/50)
+  # - Prioritize mAP: det_weight=2.0, vq_weight=0.5 (80/20)
+  # - Prioritize reconstruction: det_weight=0.5, vq_weight=2.0 (20/80)
   
 # Evaluation configuration
 evaluation:
@@ -49,6 +57,7 @@ evaluation:
   use_num_codebook: 1
   use_num_embedding: 16
   rq_ckpt: null
+  test_combinations: []  # Will be auto-generated if empty
   
 # Logging and saving
 logging:
@@ -56,9 +65,10 @@ logging:
   wandb_project: "pointpillars-rq-progressive"
   wandb_name: null
   log_freq: 8
-  saved_path: "progressive_rq_logs"
   save_stage_weights: True
+
+save_stage_weights: True  # Also keep at top level for compatibility
   
 # Hardware
 hardware:
-  gpu: 1
+  gpu: 3

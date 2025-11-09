@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """
-Vector Quantization (VQ) and Residual Quantization (RQ) Implementation
+Vector Quantization (VQ) and Residual Quantization (RQ) Implementation with Progressive Training Support
 """
 
 from typing import Iterable
@@ -22,9 +22,28 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 
 
 class VQEmbedding(nn.Embedding):
+    """
+    Vector Quantization Embedding with progressive training support.
+    
+    Supports:
+    - EMA updates for codebook learning
+    - Progressive training with configurable active/frozen ranges
+    - Gradient-based training with automatic frozen embedding protection
+    - Automatic restart of unused codebook entries
+    
+    Args:
+        n_embed (int): Number of embeddings in codebook
+        embed_dim (int): Dimension of each embedding vector
+        ema (bool): Whether to use EMA for codebook updates
+        decay (float): EMA decay factor (default: 0.99)
+        restart_unused_codes (bool): Whether to reinitialize unused codes
+        eps (float): Small constant for numerical stability
+    """
 
     def __init__(self, n_embed, embed_dim, ema=True, decay=0.99, restart_unused_codes=True, eps=1e-5):
         super().__init__(n_embed + 1, embed_dim, padding_idx=n_embed)
@@ -34,67 +53,143 @@ class VQEmbedding(nn.Embedding):
         self.eps = eps
         self.restart_unused_codes = restart_unused_codes
         self.n_embed = n_embed
-        self.embed_dim = embed_dim  # Store for later use
 
         self._trainable = True
         self.active_n_embed = n_embed
         self.frozen_n_embed = 0
-        self._use_ema = ema # 直接將 ema 參數設為一個可變的屬性
+        self._use_ema = ema
+        self._hook_handle = None
         
-        # Initialize with normal distribution for better training stability
-        nn.init.normal_(self.weight, mean=0.0, std=1.0 / np.sqrt(embed_dim))
+        # Always register EMA buffers (needed for both modes)
+        self.register_buffer('cluster_size_ema', torch.zeros(n_embed))
+        self.register_buffer('embed_ema', self.weight[:-1, :].detach().clone())
+        # Snapshot of cluster_size_ema for frozen embeddings (for stable weight computation)
+        self.register_buffer('frozen_cluster_size_ema', torch.zeros(n_embed))
         
         if self.ema:
             _ = [p.requires_grad_(False) for p in self.parameters()]
-            self.register_buffer('cluster_size_ema', torch.zeros(n_embed, dtype=torch.float32))
-            self.register_buffer('embed_ema', self.weight[:-1, :].detach().clone())
+        else:
+            self._register_gradient_hook()
 
     @property
     def trainable(self):
+        """Returns whether the codebook is trainable."""
         return self._trainable
 
     @trainable.setter
     def trainable(self, value):
+        """Sets the trainable state and updates weight gradient requirement."""
         self._trainable = value
         self.weight.requires_grad = (not self.use_ema) and self._trainable
 
     @property
     def use_ema(self):
+        """Returns whether EMA updates are enabled."""
         return self._use_ema
 
     @use_ema.setter
     def use_ema(self, value):
-        """
-        【核心修正】簡化 setter 邏輯。
-        設定 use_ema 後，立即根據新狀態更新 requires_grad。
-        移除了對 self.trainable 的遞迴呼叫。
-        """
+        """Sets EMA mode and manages gradient hooks accordingly."""
         self._use_ema = value
-        # 狀態改變後，立即更新梯度需求。
         self.weight.requires_grad = (not self._use_ema) and self._trainable
+        
+        if not value and self._trainable:
+            self._register_gradient_hook()
+        else:
+            self._remove_gradient_hook()
 
     def reset_usage_tracking(self):
+        """Resets the cluster usage tracking buffer."""
         self.register_buffer('cluster_size', torch.zeros(self.active_n_embed))
 
     def set_frozen_n_embed(self, n):
+        """
+        Sets the number of frozen (non-trainable) embeddings.
+        Saves a snapshot of cluster_size_ema for the frozen range.
+        
+        Args:
+            n (int): Number of embeddings to freeze from index 0
+        """
+        assert 0 <= n <= self.n_embed, f"frozen_n_embed must be in [0, {self.n_embed}]"
+        
+        # Save snapshot of cluster_size_ema for frozen range
+        if n > self.frozen_n_embed:
+            self.frozen_cluster_size_ema[:n] = self.cluster_size_ema[:n].clone()
+        
         self.frozen_n_embed = n
 
     def set_active_n_embed(self, n):
+        """
+        Sets the number of active embeddings to use.
+        
+        Args:
+            n (int): Number of active embeddings
+        """
+        assert 0 <= n <= self.n_embed, f"active_n_embed must be in [0, {self.n_embed}]"
+        assert n >= self.frozen_n_embed, f"active_n_embed ({n}) must be >= frozen_n_embed ({self.frozen_n_embed})"
         self.active_n_embed = n
+
+    @property
+    def trainable_range(self):
+        """Returns the trainable range as (start_idx, end_idx)."""
+        return (self.frozen_n_embed, self.active_n_embed)
+    
+    @property
+    def n_trainable(self):
+        """Returns the number of trainable embeddings."""
+        return max(0, self.active_n_embed - self.frozen_n_embed)
+
+    def _register_gradient_hook(self):
+        """Register gradient hook to protect frozen and inactive embeddings."""
+        if self._hook_handle is not None:
+            return
+        
+        def gradient_hook(grad):
+            """Zero out gradients for frozen and inactive embedding ranges."""
+            if grad is None:
+                return None
+            
+            grad = grad.clone()
+            
+            if self.frozen_n_embed > 0:
+                grad[:self.frozen_n_embed] = 0.0
+            
+            if self.active_n_embed < self.n_embed:
+                grad[self.active_n_embed:self.n_embed] = 0.0
+            
+            return grad
+        
+        self._hook_handle = self.weight.register_hook(gradient_hook)
+    
+    def _remove_gradient_hook(self):
+        """Remove the registered gradient hook."""
+        if self._hook_handle is not None:
+            self._hook_handle.remove()
+            self._hook_handle = None
 
     @torch.no_grad()
     def compute_distances(self, inputs):
-        # 如果沒有 active embedding，返回極大的距離
+        """
+        Computes L2 distances between input vectors and codebook embeddings.
+        
+        Args:
+            inputs (Tensor): Input vectors of shape (..., embed_dim)
+            
+        Returns:
+            Tensor: Distances of shape (..., active_n_embed)
+        """
         if self.active_n_embed == 0:
             return torch.full((*inputs.shape[:-1], 1), float('inf'), device=inputs.device)
             
         codebook_t = self.weight[:self.active_n_embed, :].t()
         (embed_dim, _) = codebook_t.shape
         inputs_shape = inputs.shape
-        assert inputs_shape[-1] == embed_dim
+        assert inputs_shape[-1] == embed_dim, f"Input dim {inputs_shape[-1]} != embed_dim {embed_dim}"
+        
         inputs_flat = inputs.reshape(-1, embed_dim)
         inputs_norm_sq = inputs_flat.pow(2.).sum(dim=1, keepdim=True)
         codebook_t_norm_sq = codebook_t.pow(2.).sum(dim=0, keepdim=True)
+        
         distances = torch.addmm(
             inputs_norm_sq + codebook_t_norm_sq,
             inputs_flat,
@@ -106,189 +201,280 @@ class VQEmbedding(nn.Embedding):
 
     @torch.no_grad()
     def find_nearest_embedding(self, inputs):
-        # 如果沒有 active embedding，返回全零的索引
+        """
+        Finds the nearest codebook embedding indices for input vectors.
+        
+        Args:
+            inputs (Tensor): Input vectors of shape (..., embed_dim)
+            
+        Returns:
+            Tensor: Embedding indices of shape (...)
+        """
         if self.active_n_embed == 0:
             return torch.zeros(*inputs.shape[:-1], dtype=torch.long, device=inputs.device)
             
         distances = self.compute_distances(inputs)
         embed_idxs = distances.argmin(dim=-1)
-        embed_idxs = embed_idxs.clamp(max=self.active_n_embed - 1)
+        embed_idxs = embed_idxs.clamp(0, self.active_n_embed - 1)
+        
         return embed_idxs
 
     @torch.no_grad()
     def _update_buffers(self, vectors, idxs):
+        """
+        Update EMA buffers for trainable embeddings only.
+        Filters out frozen embeddings [0:frozen_n_embed].
+        
+        Args:
+            vectors (Tensor): Input vectors of shape (..., embed_dim)
+            idxs (Tensor): Assigned embedding indices of shape (...)
+        """
         if not self._trainable:
             return
 
-        # Safety check: ensure we have valid tensors
-        if vectors.numel() == 0 or idxs.numel() == 0 or self.active_n_embed == 0:
-            return
-        
-        # Ensure tensors are on the same device
-        if vectors.device != idxs.device:
-            idxs = idxs.to(vectors.device)
-
         n_active = self.active_n_embed
+        update_start = self.frozen_n_embed
+        
+        if n_active == 0 or update_start >= n_active:
+            return
+
         embed_dim = self.weight.shape[-1]
 
         vectors_flat = vectors.reshape(-1, embed_dim)
-        idxs_flat = idxs.reshape(-1)
+        idxs_flat = idxs.reshape(-1).clamp(0, n_active - 1)
         
-        # Additional safety: check for NaN or inf values
-        if torch.isnan(vectors_flat).any() or torch.isinf(vectors_flat).any():
-            print("Warning: NaN or inf detected in vectors, skipping update")
+        # Filter to trainable range only
+        valid_mask = (idxs_flat >= update_start) & (idxs_flat < n_active)
+        valid_idxs = idxs_flat[valid_mask]
+        valid_vectors = vectors_flat[valid_mask]
+        
+        if len(valid_idxs) == 0:
             return
         
-        # Clamp indices to be safe
-        clamped_idxs = idxs_flat.clamp(0, n_active - 1)
+        # Remap to [0, n_trainable) range
+        n_trainable = n_active - update_start
+        remapped_idxs = valid_idxs - update_start
         
-        try:
-            one_hot = F.one_hot(clamped_idxs, num_classes=n_active).float()
-            cluster_size = one_hot.sum(dim=0)
-
-            # 只更新未 frozen 的 embedding
-            update_start = self.frozen_n_embed
-            vectors_sum_per_cluster = one_hot.t() @ vectors_flat
-            self.cluster_size_ema[update_start:n_active].mul_(self.decay).add_(cluster_size[update_start:], alpha=1 - self.decay)
-            self.embed_ema[update_start:n_active].mul_(self.decay).add_(vectors_sum_per_cluster[update_start:], alpha=1 - self.decay)
-        except Exception as e:
-            print(f"Warning: Error in buffer update, skipping. Error: {e}")
-            return
+        # Compute cluster statistics
+        one_hot = F.one_hot(remapped_idxs, num_classes=n_trainable).float()
+        cluster_size = one_hot.sum(dim=0)
+        vectors_sum_per_cluster = one_hot.t() @ valid_vectors
         
+        # Update EMA buffers for trainable range
+        self.cluster_size_ema[update_start:n_active].mul_(self.decay).add_(
+            cluster_size, alpha=1 - self.decay
+        )
+        self.embed_ema[update_start:n_active].mul_(self.decay).add_(
+            vectors_sum_per_cluster, alpha=1 - self.decay
+        )
+        
+        # Restart unused codes in trainable range
         if self.restart_unused_codes:
-            unused_indices = torch.where(self.cluster_size_ema[update_start:n_active] < self.eps)[0] + update_start
-            n_unused = unused_indices.shape[0]
-            if n_unused > 0:
-                n_vectors_flat = vectors_flat.shape[0]
+            trainable_cluster_size = self.cluster_size_ema[update_start:n_active]
+            unused_indices_relative = torch.where(trainable_cluster_size < self.eps)[0]
+            
+            if len(unused_indices_relative) > 0 and valid_vectors.shape[0] > 0:
+                unused_indices = unused_indices_relative + update_start
+                n_unused = len(unused_indices)
+                n_valid = valid_vectors.shape[0]
                 
-                # Safety check: if no vectors, use zeros instead
-                if n_vectors_flat == 0:
-                    random_vectors = torch.zeros(n_unused, embed_dim, device=vectors.device, dtype=vectors.dtype)
+                if n_valid <= 0:
+                    return
+                
+                # Randomly select vectors for reinitialization
+                # WORKAROUND: PyTorch 1.10.x has torch.randperm bugs on CUDA
+                # Generate indices on CPU then move to GPU
+                if n_valid < n_unused:
+                    # Need to sample with replacement
+                    rand_indices = torch.randint(0, n_valid, (n_unused,), device=vectors.device)
                 else:
-                    # Ensure indices are valid and within bounds
-                    try:
-                        # Generate random indices with safety bounds
-                        rand_indices = torch.randperm(n_vectors_flat, device=vectors.device, dtype=torch.long)
-                        
-                        if n_vectors_flat < n_unused:
-                            # Repeat indices safely
-                            n_repeats = (n_unused + n_vectors_flat - 1) // n_vectors_flat
-                            rand_indices = rand_indices.repeat(n_repeats)
-                        
-                        # Ensure we don't exceed the vectors_flat size and have valid indices
-                        max_valid_idx = min(n_unused, rand_indices.size(0), n_vectors_flat)
-                        if max_valid_idx > 0:
-                            rand_indices = rand_indices[:max_valid_idx].clamp(0, n_vectors_flat - 1)
-                            random_vectors = vectors_flat[rand_indices]
-                        else:
-                            random_vectors = torch.zeros(0, embed_dim, device=vectors.device, dtype=vectors.dtype)
-                        
-                        # If we still don't have enough vectors, pad with zeros
-                        if random_vectors.size(0) < n_unused:
-                            padding_size = n_unused - random_vectors.size(0)
-                            padding = torch.zeros(padding_size, embed_dim, device=vectors.device, dtype=vectors.dtype)
-                            random_vectors = torch.cat([random_vectors, padding], dim=0)
-                    except Exception as e:
-                        # Fallback: use zeros if anything goes wrong
-                        print(f"Warning: Error in restart_unused_codes, using zeros. Error: {e}")
-                        random_vectors = torch.zeros(n_unused, embed_dim, device=vectors.device, dtype=vectors.dtype)
+                    # Generate on CPU to avoid PyTorch 1.10.x CUDA bug
+                    rand_indices_cpu = torch.randperm(n_valid)[:n_unused]
+                    rand_indices = rand_indices_cpu.to(vectors.device)
                 
-                # Ensure unused_indices are valid before assignment
-                if unused_indices.numel() > 0 and random_vectors.size(0) == n_unused:
-                    unused_indices = unused_indices.clamp(0, self.embed_ema.size(0) - 1)
-                    world_size = dist.get_world_size() if dist.is_initialized() else 1
-                    self.embed_ema[unused_indices] = random_vectors
-                    self.cluster_size_ema[unused_indices] = torch.ones_like(self.cluster_size_ema[unused_indices]) * (1.0 / world_size)
+                random_vectors = valid_vectors[rand_indices]
+                world_size = dist.get_world_size() if dist.is_initialized() else 1
+                self.embed_ema[unused_indices] = random_vectors
+                self.cluster_size_ema[unused_indices] = 1.0 / world_size
 
     @torch.no_grad()
     def _update_embedding(self):
+        """
+        Update embedding weights from EMA buffers.
+        - Frozen range [0:frozen_n_embed]: Uses frozen_cluster_size_ema snapshot
+        - Trainable range [frozen_n_embed:active_n_embed]: Uses current cluster_size_ema
+        """
         if not self._trainable:
             return
+        
         n_active = self.active_n_embed
-        update_start = self.frozen_n_embed
-        n = self.cluster_size_ema[update_start:n_active].sum()
-        normalized_cluster_size = (
-            n * (self.cluster_size_ema[update_start:n_active] + self.eps) / (n + (n_active - update_start) * self.eps)
-        )
-        # 加入 clamp 避免過小值
-        normalized_cluster_size = normalized_cluster_size.clamp(min=self.eps)
-        self.weight.data[update_start:n_active, :] = self.embed_ema[update_start:n_active] / normalized_cluster_size.reshape(-1, 1)
+        frozen_end = self.frozen_n_embed
+        
+        if n_active == 0:
+            return
+
+        # Update frozen range with snapshot (keeps weight stable)
+        if frozen_end > 0:
+            frozen_cluster_size = self.frozen_cluster_size_ema[:frozen_end]
+            n_frozen_total = frozen_cluster_size.sum()
+            
+            if n_frozen_total > 0:
+                normalized_frozen = (
+                    n_frozen_total * (frozen_cluster_size + self.eps) / 
+                    (n_frozen_total + frozen_end * self.eps)
+                ).clamp(min=self.eps)
+                
+                self.weight.data[:frozen_end, :] = (
+                    self.embed_ema[:frozen_end] / normalized_frozen.unsqueeze(-1)
+                )
+
+        # Update trainable range with current statistics
+        if frozen_end < n_active:
+            trainable_cluster_size = self.cluster_size_ema[frozen_end:n_active]
+            n_trainable_total = trainable_cluster_size.sum()
+            n_trainable = n_active - frozen_end
+            
+            if n_trainable_total > 0:
+                normalized_trainable = (
+                    n_trainable_total * (trainable_cluster_size + self.eps) / 
+                    (n_trainable_total + n_trainable * self.eps)
+                ).clamp(min=self.eps)
+                
+                self.weight.data[frozen_end:n_active, :] = (
+                    self.embed_ema[frozen_end:n_active] / normalized_trainable.unsqueeze(-1)
+                )
 
     @torch.no_grad()
     def sync_ema_weights(self):
         """
-        手動將 EMA buffer 的權重同步到模型的 'weight' 中。
-        這在從 EMA 預熱切換到評估或梯度訓練時至關重要。
+        Manually synchronize EMA buffers to weights.
+        - Frozen range: Uses frozen_cluster_size_ema snapshot
+        - Trainable range: Uses current cluster_size_ema
         
-        【關鍵修正】確保只同步有效的 embedding 範圍，避免覆蓋未訓練的部分
+        Note: Usually not needed as forward() auto-syncs after each batch.
+        Use only for manual sync outside training or before saving checkpoints.
         """
         if not self.ema or not hasattr(self, 'embed_ema'):
             return
 
-        # 如果沒有 active embedding，跳過同步
-        if self.active_n_embed == 0:
-            # print(f"Skipping sync for codebook with active_n_embed=0")
-            return
-
         n_embed = self.active_n_embed
-        update_start = self.frozen_n_embed
+        frozen_end = self.frozen_n_embed
         
-        # 確保範圍有效
-        if update_start >= n_embed:
-            # print(f"Skipping sync: update_start({update_start}) >= n_embed({n_embed})")
+        if n_embed == 0:
             return
         
-        # 處理分母為零的情況
-        cluster_size = self.cluster_size_ema[update_start:n_embed]
-        n = cluster_size.sum()
-        
-        # 如果沒有聚類數據，跳過同步
-        if n == 0:
-            # print(f"Skipping sync: no cluster data for range [{update_start}:{n_embed}]")
-            return
+        # Sync frozen range with snapshot
+        if frozen_end > 0:
+            frozen_cluster_size = self.frozen_cluster_size_ema[:frozen_end]
+            n_frozen_total = frozen_cluster_size.sum()
             
-        normalized_cluster_size = (
-            n * (cluster_size + self.eps) / (n + (n_embed - update_start) * self.eps)
-        )
+            if n_frozen_total > 0:
+                normalized_frozen = (
+                    n_frozen_total * (frozen_cluster_size + self.eps) / 
+                    (n_frozen_total + frozen_end * self.eps)
+                ).clamp(min=self.eps)
+                
+                self.weight.data[:frozen_end, :] = (
+                    self.embed_ema[:frozen_end] / normalized_frozen.unsqueeze(-1)
+                )
         
-        # 增加 clamp 防止正規化後的值過小，導致除法不穩定
-        normalized_cluster_size = normalized_cluster_size.clamp(min=self.eps)
+        # Sync trainable range with current statistics
+        if frozen_end < n_embed:
+            trainable_cluster_size = self.cluster_size_ema[frozen_end:n_embed]
+            n_trainable_total = trainable_cluster_size.sum()
+            n_trainable = n_embed - frozen_end
+            
+            if n_trainable_total > 0:
+                normalized_trainable = (
+                    n_trainable_total * (trainable_cluster_size + self.eps) / 
+                    (n_trainable_total + n_trainable * self.eps)
+                ).clamp(min=self.eps)
 
-        # 獲取 EMA 更新後的 embedding
-        ema_weights = self.embed_ema[update_start:n_embed] / normalized_cluster_size.unsqueeze(-1)
-        
-        # 更新主權重張量
-        self.weight.data[update_start:n_embed, :] = ema_weights
+                self.weight.data[frozen_end:n_embed, :] = (
+                    self.embed_ema[frozen_end:n_embed] / normalized_trainable.unsqueeze(-1)
+                )
 
     def forward(self, inputs):
+        """
+        Quantize inputs to nearest codebook embeddings.
+        
+        Args:
+            inputs (Tensor): Input vectors (..., embed_dim)
+            
+        Returns:
+            tuple: (embeds, embed_idxs) - Quantized embeddings and their indices
+        """
         embed_idxs = self.find_nearest_embedding(inputs)
-        # 【修正】按照官方邏輯，先判斷是否更新 buffers
+        
         if self.training and self._use_ema and self._trainable:
             self._update_buffers(inputs, embed_idxs)
         
         embeds = self.embed(embed_idxs)
         
-        # 【修正】按照官方邏輯，在 embed 之後更新 embedding
         if self.training and self._use_ema and self._trainable:
             self._update_embedding()
             
         return embeds, embed_idxs
 
     def embed(self, idxs):
-        # Ensure indices are within valid range
-        if idxs.numel() == 0:
-            # Return empty tensor with correct shape
-            return torch.zeros(*idxs.shape, self.embed_dim, device=idxs.device, dtype=self.weight.dtype)
+        """
+        Converts embedding indices to embedding vectors.
         
-        # Clamp indices to prevent out-of-bounds access
-        safe_idxs = idxs.clamp(0, self.n_embed - 1)
-        embeds = super().forward(safe_idxs)
+        Args:
+            idxs (Tensor): Embedding indices
+            
+        Returns:
+            Tensor: Embedding vectors
+        """
+        embeds = super().forward(idxs)
         return embeds
+
+    def get_codebook_stats(self):
+        """Get codebook statistics for monitoring."""
+        stats = {
+            'total_n_embed': self.n_embed,
+            'active_n_embed': self.active_n_embed,
+            'frozen_n_embed': self.frozen_n_embed,
+            'trainable_n_embed': self.n_trainable,
+            'trainable': self._trainable,
+            'use_ema': self._use_ema,
+            'weight_requires_grad': self.weight.requires_grad,
+        }
+        
+        if hasattr(self, 'cluster_size_ema'):
+            cluster_size = self.cluster_size_ema
+            stats.update({
+                'cluster_size_mean': cluster_size.mean().item(),
+                'cluster_size_min': cluster_size.min().item(),
+                'cluster_size_max': cluster_size.max().item(),
+                'n_unused_codes': (cluster_size < self.eps).sum().item(),
+            })
+        
+        return stats
+
+    def __repr__(self):
+        return (f"VQEmbedding(n_embed={self.n_embed}, embed_dim={self.embedding_dim}, "
+                f"active={self.active_n_embed}, frozen={self.frozen_n_embed}, "
+                f"trainable={self._trainable}, ema={self._use_ema})")
 
 
 class RQBottleneck(nn.Module):
     """
-    Residual Quantizer Bottleneck Module
+    Residual Quantization Bottleneck Module with progressive training support.
+    
+    This module applies multiple stages of vector quantization to the residual
+    from previous stages, enabling hierarchical compression of features.
+    
+    Args:
+        latent_shape (tuple): Shape of latent features (H, W, C)
+        code_shape (tuple): Shape of quantized codes (h, w, depth)
+        n_embed (int or list): Number of embeddings per codebook
+        decay (float or list): EMA decay factor(s)
+        shared_codebook (bool): Whether to share codebook across depth
+        restart_unused_codes (bool): Whether to restart unused codes
+        commitment_loss (str): Type of commitment loss ('cumsum' or other)
+        codebook_num (int): Number of codebooks (for compatibility)
+        ema (bool): Whether to use EMA updates
     """
 
     def __init__(self,
@@ -299,8 +485,7 @@ class RQBottleneck(nn.Module):
                  shared_codebook=False,
                  restart_unused_codes=True,
                  commitment_loss='cumsum',
-                 codebook_num=None,
-                 ema=True,  # 新增参数
+                 ema=True,
                  ):
         super().__init__()
 
@@ -314,18 +499,16 @@ class RQBottleneck(nn.Module):
         self.latent_shape = torch.Size(latent_shape)
         self.code_shape = torch.Size(code_shape)
         self.shape_divisor = torch.Size([latent_shape[i] // code_shape[i] for i in range(len(latent_shape))])
-        self.codebook_num = codebook_num
         self.shared_codebook = shared_codebook
         
         if self.shared_codebook:
             if isinstance(n_embed, Iterable) or isinstance(decay, Iterable):
-                raise ValueError("Shared codebooks are incompatible \
-                                    with list types of momentums or sizes: Change it into int")
+                raise ValueError("Shared codebooks are incompatible with list types of momentums or sizes")
 
         self.restart_unused_codes = restart_unused_codes
         self.n_embed = n_embed if isinstance(n_embed, (list, tuple)) else [n_embed] * self.code_shape[-1]
         self.decay = decay if isinstance(decay, (list, tuple)) else [decay] * self.code_shape[-1]
-        self.ema = ema  # 保存 ema 参数
+        self.ema = ema
         assert len(self.n_embed) == self.code_shape[-1]
         assert len(self.decay) == self.code_shape[-1]
 
@@ -334,7 +517,7 @@ class RQBottleneck(nn.Module):
                                     embed_dim, 
                                     decay=self.decay[0], 
                                     restart_unused_codes=restart_unused_codes,
-                                    ema=self.ema  # 使用传入的参数
+                                    ema=self.ema
                                     )
             self.codebooks = nn.ModuleList([codebook0 for _ in range(self.code_shape[-1])])
         else:
@@ -342,18 +525,19 @@ class RQBottleneck(nn.Module):
                                      embed_dim, 
                                      decay=self.decay[idx], 
                                      restart_unused_codes=restart_unused_codes,
-                                     ema=self.ema  # 使用传入的参数
+                                     ema=self.ema
                                      ) for idx in range(self.code_shape[-1])]
             self.codebooks = nn.ModuleList(codebooks)
 
         self.commitment_loss = commitment_loss
         
     def set_ema_mode(self, ema_mode):
-        """切換所有 codebook 的 EMA 模式"""
+        """Sets EMA mode for all codebooks."""
         for cb in self.codebooks:
             cb.use_ema = ema_mode
 
     def to_code_shape(self, x):
+        """Reshapes latent tensor to code shape."""
         (B, H, W, D) = x.shape
         (rH, rW, _) = self.shape_divisor
         x = x.reshape(B, H//rH, rH, W//rW, rW, D)
@@ -362,6 +546,7 @@ class RQBottleneck(nn.Module):
         return x
 
     def to_latent_shape(self, x):
+        """Reshapes code tensor to latent shape."""
         (B, h, w, _) = x.shape
         (_, _, D) = self.latent_shape
         (rH, rW, _) = self.shape_divisor
@@ -372,56 +557,145 @@ class RQBottleneck(nn.Module):
 
     def set_training_stage(self, active_codebook_idx, active_embed_size, full_embed_size, prev_embed_size=0):
         """
-        設定模型進行漸進式訓練的特定階段。
+        Configures the model for a specific progressive training stage.
+        
+        This method sets up the codebooks for progressive training where:
+        - Codebooks before active_codebook_idx are fully trained and frozen
+        - The active codebook is being trained with possible frozen embeddings
+        - Codebooks after active_codebook_idx are inactive
+        
+        Example:
+            # Train codebook 0, embeddings [0:64]
+            rq.set_training_stage(active_codebook_idx=0, active_embed_size=64, 
+                                  full_embed_size=256, prev_embed_size=0)
+            
+            # Train codebook 0, embeddings [64:128], freeze [0:64]
+            rq.set_training_stage(active_codebook_idx=0, active_embed_size=128,
+                                  full_embed_size=256, prev_embed_size=64)
 
         Args:
-            active_codebook_idx (int): 當前正在訓練的 codebook 的索引。
-            active_embed_size (int): 當前 codebook 使用的 embedding 數量。
-            full_embed_size (int): 一個 codebook 訓練完成後的 embedding 總數。
-            prev_embed_size (int): 上一個 embedding 階段的大小，用於設定 frozen 邊界。
+            active_codebook_idx (int): Index of the codebook being trained (0-indexed)
+            active_embed_size (int): Number of embeddings to use in current codebook
+            full_embed_size (int): Total number of embeddings when codebook is fully trained
+            prev_embed_size (int): Number of embeddings to freeze (from previous stage)
+        
+        Raises:
+            AssertionError: If active_codebook_idx is out of range
         """
+        assert 0 <= active_codebook_idx < len(self.codebooks), \
+            f"active_codebook_idx {active_codebook_idx} out of range [0, {len(self.codebooks)})"
+        
         for i, cb in enumerate(self.codebooks):
             if i == active_codebook_idx:
-                # 當前正在訓練的 codebook
+                # Currently training codebook
                 cb.trainable = True
                 cb.set_active_n_embed(active_embed_size)
                 cb.set_frozen_n_embed(prev_embed_size)
             elif i < active_codebook_idx:
-                # 已經訓練完成的 codebook：設為不可訓練並完全凍結
+                # Previously trained codebooks: frozen and fully active
                 cb.trainable = False
-                cb.set_active_n_embed(full_embed_size)
+                cb.set_active_n_embed(active_embed_size)
                 cb.set_frozen_n_embed(full_embed_size)
             else:
-                # 尚未開始訓練的 codebook：設為不可訓練並關閉
+                # Not yet trained codebooks: inactive
                 cb.trainable = False
                 cb.set_active_n_embed(0)
                 cb.set_frozen_n_embed(0)
 
     def set_evaluation_stage(self, num_codebooks, num_embeddings):
-        """為評估設定 codebook 狀態。"""
+        """
+        Configures codebooks for evaluation mode.
+        
+        Sets all codebooks to non-trainable and activates only the specified
+        number of codebooks with the given number of embeddings.
+        
+        Example:
+            # Use first 2 codebooks with 256 embeddings each
+            rq.set_evaluation_stage(num_codebooks=2, num_embeddings=256)
+        
+        Args:
+            num_codebooks (int): Number of codebooks to use (from index 0)
+            num_embeddings (int): Number of embeddings per active codebook
+            
+        Raises:
+            AssertionError: If num_codebooks is out of range
+        """
+        assert 0 <= num_codebooks <= len(self.codebooks), \
+            f"num_codebooks {num_codebooks} out of range [0, {len(self.codebooks)}]"
+        
         for i, cb in enumerate(self.codebooks):
             if i < num_codebooks:
-                # 使用的 codebook
+                # Active codebooks for evaluation
                 cb.trainable = False
                 cb.set_active_n_embed(num_embeddings)
                 cb.set_frozen_n_embed(0)
             else:
-                # 不使用的 codebook
+                # Inactive codebooks
                 cb.trainable = False
                 cb.set_active_n_embed(0)
                 cb.set_frozen_n_embed(0)
 
     def sync_all_ema_weights(self):
-        """遍歷所有 codebook 並同步它們的 EMA 權重。"""
-        # print("--- Syncing all EMA codebook weights ---")
+        """
+        Synchronizes EMA weights to main weights for all codebooks.
+        
+        Note: This is usually NOT needed during normal training, as VQEmbedding.forward()
+        automatically calls _update_embedding() to sync weights after each batch.
+        
+        Use this method only in special cases:
+        - Before saving checkpoints if you want to ensure absolutely latest EMA state
+        - In distributed training scenarios for manual synchronization across GPUs
+        - For debugging or verification purposes
+        - When directly manipulating EMA buffers outside of forward pass
+        
+        For normal progressive training, the automatic updates in forward() are sufficient.
+        """
         for cb in self.codebooks:
             if hasattr(cb, 'sync_ema_weights'):
                 cb.sync_ema_weights()
+    
+    def get_codebook_stats(self):
+        """
+        Returns statistics for all codebooks (useful for debugging/monitoring).
+        
+        Returns:
+            list: List of dictionaries containing stats for each codebook
+        """
+        stats_list = []
+        for i, cb in enumerate(self.codebooks):
+            if hasattr(cb, 'get_codebook_stats'):
+                stats = cb.get_codebook_stats()
+                stats['codebook_idx'] = i
+                stats_list.append(stats)
+        return stats_list
+    
+    def print_codebook_status(self):
+        """Prints a summary of the current codebook configuration."""
+        status_lines = ["Codebook Status:"]
+        for i, cb in enumerate(self.codebooks):
+            trainable_str = "trainable" if cb.trainable else "frozen"
+            status_lines.append(
+                f"  CB{i}: {trainable_str} | active=[0:{cb.active_n_embed}] | "
+                f"frozen=[0:{cb.frozen_n_embed}] | training={cb.n_trainable} embeds"
+            )
+        return "\n".join(status_lines)
 
     def forward(self, x):
         """
-        Residual Quantization forward with progressive/freeze support.
-        只訓練 codebooks，不需要 STE
+        Forward pass: applies residual quantization.
+        
+        The process iterates through codebooks, each quantizing the residual from
+        the previous stage. Trainable codebooks use EMA updates, while frozen
+        codebooks only participate in the forward computation.
+        
+        Args:
+            x (Tensor): Input latent features of shape (B, H, W, C)
+            
+        Returns:
+            quants_final (Tensor): Quantized output of shape (B, H, W, C)
+            final_vq_loss (Tensor): VQ loss (commitment loss)
+            final_codebook_loss (Tensor): Codebook loss
+            final_codes (Tensor): Quantization codes of shape (B, h, w, depth)
         """
         x_reshaped = self.to_code_shape(x)
         residual = x_reshaped.detach().clone()
@@ -432,66 +706,101 @@ class RQBottleneck(nn.Module):
         codebook_losses = []
 
         for codebook in self.codebooks:
-            # 完全跳過未啟動的 codebook，不進行任何計算
+            # Skip inactive codebooks
             if codebook.active_n_embed == 0:
                 continue
 
+            # Find nearest embedding indices for current residual
             with torch.no_grad():
                 codes = codebook.find_nearest_embedding(residual)
 
+            # Get embedding vectors
+            # Sanity checks to avoid CUDA device-side asserts (convert to clear Python errors)
+            try:
+                # ensure indices are integer type
+                if not codes.dtype == torch.long:
+                    codes = codes.long()
+
+                # check index range against embedding table
+                num_embeds = codebook.weight.shape[0]
+                if codes.numel() > 0:
+                    min_idx = int(codes.min().item())
+                    max_idx = int(codes.max().item())
+                    if min_idx < 0 or max_idx >= num_embeds:
+                        raise IndexError(
+                            f"Embedding index out of range for codebook: min={min_idx}, max={max_idx}, num_embeddings={num_embeds}"
+                        )
+
+                # verify devices match (indices and weight)
+                if codes.device != codebook.weight.device:
+                    raise RuntimeError(
+                        f"Device mismatch: codes.device={codes.device}, codebook.weight.device={codebook.weight.device}"
+                    )
+
+            except Exception:
+                # Re-raise with additional context for easier debugging
+                raise
+
             quant = codebook.embed(codes)
 
-            # 3. progressive/freeze 控制
+            # Update residual and accumulate quantized values
             if codebook.trainable:
                 if codebook.use_ema and self.training:
-                    # EMA 模式：更新 buffers 和 embeddings，但仍計算損失進行監控
-                    # Check if we have any elements in the tensor before updating
-                    if residual.numel() > 0 and codes.numel() > 0:
-                        codebook._update_buffers(residual, codes)
-                        codebook._update_embedding()
+                    # EMA mode: Update codebook via EMA
+                    codebook._update_buffers(residual, codes)
+                    codebook._update_embedding()
                     
-                    # 計算損失（但不用於反向傳播，因為已經detach）
-                    vq_losses.append(F.mse_loss(residual, quant.detach()))
-                    codebook_losses.append(F.mse_loss(quant.detach(), residual))
+                    # Detach to prevent gradient flow in EMA mode
                     residual = residual - quant.detach()
                     aggregated_quants = aggregated_quants + quant.detach()
                 else:
-                    # 梯度模式：計算 VQ 損失，保持梯度用於 codebook 訓練
-                    vq_losses.append(F.mse_loss(residual, quant))
+                    # Gradient mode: Compute VQ losses with gradients
+                    vq_losses.append(F.mse_loss(residual.detach(), quant))
                     codebook_losses.append(F.mse_loss(quant.detach(), residual))
-                    # 更新殘差（detach 避免累積計算圖）和累積量化結果（保持梯度）
+                    
+                    # Update residual and accumulate quantized values (keep gradients)
                     residual = residual.detach() - quant.detach()
                     aggregated_quants = aggregated_quants + quant
             else:
-                # 凍結的 codebook：參與計算但不參與訓練
+                # Frozen codebook: Detach everything
                 residual = residual - quant.detach()
                 aggregated_quants = aggregated_quants + quant.detach()
 
             code_list.append(codes.unsqueeze(-1))
 
-        # 處理沒有任何啟動 codebook 的情況
+        # Handle edge case: no active codebooks
         if not code_list:
             final_codes = torch.empty(*self.code_shape[:-1], 0, device=x.device, dtype=torch.long)
-            return x, torch.tensor(0.0, device=x.device), torch.tensor(0.0, device=x.device), final_codes
+            zero_loss = torch.tensor(0.0, device=x.device)
+            return x, zero_loss, zero_loss, final_codes
 
+        # Concatenate codes from all codebooks
         final_codes = torch.cat(code_list, dim=-1)
 
-        # 損失計算 - 無論EMA還是梯度模式都計算（用於監控）
-        if vq_losses:
+        # Compute final losses
+        if self.training and vq_losses:
             final_vq_loss = torch.mean(torch.stack(vq_losses))
             final_codebook_loss = torch.mean(torch.stack(codebook_losses))
         else:
             final_vq_loss = torch.tensor(0.0, device=x.device)
             final_codebook_loss = torch.tensor(0.0, device=x.device)
 
-        # 最終輸出：直接使用累積的量化結果，不使用 STE
+        # Reshape to original latent shape
         quants_final = self.to_latent_shape(aggregated_quants)
-        # 移除 STE：quants_final = x + (quants_final - x).detach()
 
         return quants_final, final_vq_loss, final_codebook_loss, final_codes
 
     @torch.no_grad()
     def embed_code(self, code):
+        """
+        Embeds quantization codes back to latent space.
+        
+        Args:
+            code (Tensor): Quantization codes
+            
+        Returns:
+            Tensor: Reconstructed latent features
+        """
         assert code.shape[1:] == self.code_shape
         code_slices = torch.chunk(code, chunks=code.shape[-1], dim=-1)
         if self.shared_codebook:
@@ -504,6 +813,16 @@ class RQBottleneck(nn.Module):
     
     @torch.no_grad()
     def embed_code_with_depth(self, code, to_latent_shape=False):
+        """
+        Embeds codes while preserving depth dimension.
+        
+        Args:
+            code (Tensor): Quantization codes
+            to_latent_shape (bool): Whether to reshape to latent shape
+            
+        Returns:
+            Tensor: Embedded features with depth dimension
+        """
         assert code.shape[-1] == self.code_shape[-1]
         code_slices = torch.chunk(code, chunks=code.shape[-1], dim=-1)
         if self.shared_codebook:
@@ -517,6 +836,17 @@ class RQBottleneck(nn.Module):
 
     @torch.no_grad()
     def embed_partial_code(self, code, code_idx, decode_type='select'):
+        """
+        Embeds partial codes up to a specific depth.
+        
+        Args:
+            code (Tensor): Quantization codes
+            code_idx (int): Depth index to decode up to
+            decode_type (str): 'select' to use only code_idx, 'add' to sum up to code_idx
+            
+        Returns:
+            Tensor: Partially reconstructed features
+        """
         assert code.shape[1:] == self.code_shape
         assert code_idx < code.shape[-1]
         B, h, w, _ = code.shape
@@ -536,6 +866,18 @@ class RQBottleneck(nn.Module):
 
     @torch.no_grad()
     def get_soft_codes(self, x, temp=1.0, stochastic=False):
+        """
+        Computes soft (probabilistic) quantization codes.
+        
+        Args:
+            x (Tensor): Input features
+            temp (float): Temperature for softmax
+            stochastic (bool): Whether to sample stochastically
+            
+        Returns:
+            soft_code (Tensor): Soft assignment probabilities
+            code (Tensor): Hard assignment indices
+        """
         x = self.to_code_shape(x)
         residual_feature = x.detach().clone()
         soft_code_list = []
@@ -558,3 +900,95 @@ class RQBottleneck(nn.Module):
         code = torch.cat(code_list, dim=-1)
         soft_code = torch.cat(soft_code_list, dim=-2)
         return soft_code, code
+
+
+def visualize_rq_training_state(rq_bottleneck, save_path=None, figsize=(15, 3), dpi=100):
+    
+    n_codebooks = len(rq_bottleneck.codebooks)
+    
+    # Create figure with single row for usage rate
+    fig, axes = plt.subplots(1, n_codebooks, figsize=figsize, dpi=dpi)
+    if n_codebooks == 1:
+        axes = [axes]
+    
+    for i, codebook in enumerate(rq_bottleneck.codebooks):
+        n_embed = codebook.n_embed
+        active_n = codebook.active_n_embed
+        frozen_n = codebook.frozen_n_embed
+        
+        # ============================================================
+        # Usage Rate (使用率)
+        # ============================================================
+        ax = axes[i]
+        
+        if hasattr(codebook, 'cluster_size_ema'):
+            usage = codebook.cluster_size_ema.cpu().numpy()
+            
+            x_indices = np.arange(n_embed)
+            colors = []
+            for idx in x_indices:
+                if idx < frozen_n:
+                    colors.append('royalblue')
+                elif idx < active_n:
+                    colors.append('limegreen')
+                else:
+                    colors.append('lightgray')
+            
+            bars = ax.bar(x_indices, usage, color=colors, alpha=0.7)
+            
+            # Mark regions
+            if frozen_n > 0:
+                ax.axvspan(-0.5, frozen_n-0.5, alpha=0.1, color='blue')
+            if active_n > frozen_n:
+                ax.axvspan(frozen_n-0.5, active_n-0.5, alpha=0.1, color='green')
+            if active_n < n_embed:
+                ax.axvspan(active_n-0.5, n_embed-0.5, alpha=0.1, color='gray')
+            
+            # Mark unused codes threshold
+            ax.axhline(y=codebook.eps, color='red', linestyle='--', 
+                       linewidth=1.5, alpha=0.7, label=f'Unused threshold')
+            
+            ax.set_title(f'Codebook {i}: Embedding Index Usage Rate\n'
+                        f'Frozen:[0:{frozen_n}] Trainable:[{frozen_n}:{active_n}] Total:{n_embed}',
+                         fontsize=10, fontweight='bold')
+            ax.set_xlabel('Embedding Index', fontsize=9)
+            ax.set_ylabel('Usage Count (EMA Cluster Size)', fontsize=9)
+            ax.set_yscale('log')  # Log scale for better visualization
+            ax.grid(True, alpha=0.3, which='both')
+            ax.legend(fontsize=8, loc='upper right')
+            
+            # Add statistics
+            n_unused = (usage < codebook.eps).sum()
+            frozen_usage = usage[:frozen_n] if frozen_n > 0 else np.array([])
+            trainable_usage = usage[frozen_n:active_n] if active_n > frozen_n else np.array([])
+            
+            stats_text = f'Unused: {n_unused}/{n_embed}\n'
+            if len(frozen_usage) > 0:
+                stats_text += f'Frozen avg: {frozen_usage.mean():.2e}\n'
+            if len(trainable_usage) > 0:
+                stats_text += f'Train avg: {trainable_usage.mean():.2e}'
+            
+            ax.text(0.98, 0.97, stats_text.strip(), transform=ax.transAxes,
+                    fontsize=8, verticalalignment='top', horizontalalignment='right',
+                    bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.7))
+        else:
+            # No usage data available
+            ax.text(0.5, 0.5, 'No usage data\n(EMA not enabled)', 
+                    ha='center', va='center', transform=ax.transAxes, 
+                    fontsize=10, color='gray')
+            ax.set_title(f'Codebook {i}: Usage Rate', fontsize=10, fontweight='bold')
+            ax.set_xlabel('Embedding Index', fontsize=9)
+    
+    # Overall title
+    trainable_status = "✓ Training" if rq_bottleneck.codebooks[0].trainable else "✗ Frozen"
+    mode_str = "EMA" if rq_bottleneck.codebooks[0].use_ema else "Gradient"
+    title = f'RQBottleneck Embedding Usage Monitor ({trainable_status} | {mode_str} Mode)'
+    fig.suptitle(title, fontsize=12, fontweight='bold')
+    
+    plt.tight_layout(rect=[0, 0, 1, 0.94])
+    
+    # Save or return
+    if save_path:
+        plt.savefig(save_path, dpi=dpi, bbox_inches='tight')
+    
+    return fig

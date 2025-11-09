@@ -1,0 +1,88 @@
+seed: 42
+
+# Dataset configuration
+dataset:
+  name: KITTI
+  dir: "/home/yenhsiu/datasets"
+  num_classes: 3
+
+# Model configuration (必须与训练配置一致)
+model:
+  n_codebook: 2
+  pretrained_weight: 'pretrained/epoch_160.pth'
+  
+# Progressive learning configuration (必须与训练配置一致)
+progressive_learning:
+  enabled: True
+  embedding_schedule: [16, 32, 64, 128, 256]  # 必须与训练时一致
+  embedding_stage_epochs: 20
+  warmup_epochs: 2
+  
+# Training hyperparameters (用于模型构建)
+training:
+  mode: 'eval'  # 设置为评估模式
+  batch_size: 6
+  num_workers: 4
+  max_epoch: 100
+  init_lr: 0.001
+  ckpt_freq_epoch: 20
+  patience: 5
+  early_stopping_patience: 5
+  
+# RQ model parameters (必须与训练配置一致)
+rq_model:
+  latent_shape: [496, 432, 64]
+  code_shape: [496, 432, 1] 
+  codebook_size: 64
+  decay: 0.99
+  
+# Loss weights
+loss_weights:
+  vq_weight: 0.25
+  codebook_weight: 0.1
+  det_weight: 0.8
+  
+# 评估配置
+evaluation:
+  enabled: True
+  checkpoint_dir: "progressive_rq_logs(1,1))/checkpoints"
+  
+  # 评估选项
+  eval_final_model: True          # 评估最终全局模型
+  eval_stage_models: True         # 评估各阶段模型
+  eval_compression_analysis: True # 分析压缩性能
+  
+  # 特定模型评估设置
+  specific_evaluations:
+    # 评估最终模型（2个codebook，256个embeddings）
+    - name: "final_model"
+      num_codebooks: 2
+      num_embeddings: 256
+      checkpoint_path: "progressive_rq_logs(1,1))/checkpoints/global_cb2_256embeds_final.pth"
+    
+    # 评估不同压缩率的模型
+    - name: "high_compression"  # 高压缩率
+      num_codebooks: 1
+      num_embeddings: 16
+      checkpoint_path: "progressive_rq_logs(1,1))/checkpoints/stage_cb0_stage0_16embeds_best.pth"
+      
+    - name: "medium_compression"  # 中等压缩率
+      num_codebooks: 1
+      num_embeddings: 64
+      checkpoint_path: "progressive_rq_logs(1,1))/checkpoints/stage_cb0_stage2_64embeds_best.pth"
+      
+    - name: "low_compression"  # 低压缩率
+      num_codebooks: 2
+      num_embeddings: 128
+      checkpoint_path: "progressive_rq_logs(1,1))/checkpoints/stage_cb1_stage3_128embeds_best.pth"
+  
+# Logging and saving
+logging:
+  use_wandb: False
+  log_freq: 8
+  saved_path: "evaluation_results"
+  save_detailed_results: True
+  
+# Hardware
+hardware:
+  gpu: 1

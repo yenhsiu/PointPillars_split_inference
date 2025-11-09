@@ -594,6 +594,11 @@ def keep_bbox_from_lidar_range(result, pcd_limit_range):
     if 'camera_bboxes' not in result:
         result['camera_bboxes'] = np.zeros_like(lidar_bboxes)
     bboxes2d, camera_bboxes = result['bboxes2d'], result['camera_bboxes']
+    
+    # Convert pcd_limit_range to numpy array if it's a list
+    if isinstance(pcd_limit_range, list):
+        pcd_limit_range = np.array(pcd_limit_range)
+    
     flag1 = lidar_bboxes[:, :3] > pcd_limit_range[:3][None, :] # (n, 3)
     flag2 = lidar_bboxes[:, :3] < pcd_limit_range[3:][None, :] # (n, 3)
     keep_flag = np.all(flag1, axis=-1) & np.all(flag2, axis=-1)

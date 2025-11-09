@@ -274,8 +274,9 @@ def do_eval(det_results, gt_results, CLASSES, saved_path):
         print(f'{k} AP: {v[0]:.4f} {v[1]:.4f} {v[2]:.4f}')
         print(f'{k} AP: {v[0]:.4f} {v[1]:.4f} {v[2]:.4f}', file=f)
     f.close()
+    # 返回結果
+    return overall_results
     
-
 def main(args):
     val_dataset = Kitti(data_root=args.data_root,
                         split='val')

@@ -1,0 +1,63 @@
+seed: 42
+
+# Dataset configuration
+dataset:
+  name: KITTI
+  dir: "/home/yenhsiu/datasets"
+  num_classes: 3
+
+# Model configuration
+model:
+  n_codebook: 2
+  pretrained_weight: 'pretrained/epoch_160.pth'
+  
+# Progressive learning configuration
+progressive_learning:
+  enabled: True
+  embedding_schedule: [32, 64, 128, 256]
+  embedding_stage_epochs: 10
+  warmup_epochs: 3
+  pretrain_ema_limit: null
+  
+# Training hyperparameters
+training:
+  mode: 'eval'
+  batch_size: 6
+  num_workers: 4
+  max_epoch: 100
+  init_lr: 0.0005
+  ckpt_freq_epoch: 20
+  early_stopping_patience: 5
+  
+# RQ model parameters
+rq_model:
+  latent_shape: [496, 432, 64]
+  code_shape: [496, 432, 2]
+  codebook_size: 256
+  decay: 0.99
+  codebook_update_mode: 'LOSS'
+  
+# Loss weights
+loss_weights:
+  vq_weight: 0.25
+  codebook_weight: 0.02
+  det_weight: 1
+  
+# Evaluation configuration
+evaluation:
+  enabled: True
+  rq_ckpt: '/home/yenhsiu/PointPillars_split_inference/results/weights_LOSS_20251108_153354/weights_cb1_embed32.pth'
+  use_full_kitti_eval: true
+  test_combinations: []
+  
+# Logging and saving
+logging:
+  use_wandb: False
+  wandb_project: "pointpillars-rq-progressive"
+  wandb_name: null
+  log_freq: 8
+  save_stage_weights: False
+  
+# Hardware
+hardware:
+  gpu: 2
