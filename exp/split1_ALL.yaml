@@ -8,15 +8,15 @@ dataset:
 
 # Model configuration
 model:
-  n_codebook: 3
+  n_codebook: 10
   pretrained_weight: 'pretrained/epoch_160.pth'
   
 # Progressive learning configuration
 progressive_learning:
   enabled: True
   embedding_schedule: [16, 32, 64]  # embedding size schedule
-  embedding_stage_epochs: 3  # epochs per embedding stage
-  warmup_epochs: 1  # EMA warmup epochs per stage
+  embedding_stage_epochs: 15  # epochs per embedding stage
+  warmup_epochs: 2  # EMA warmup epochs per stage
   pretrain_ema_limit: None  # Optional: limit EMA warmup samples
   
 # Training hyperparameters
@@ -27,14 +27,14 @@ training:
   max_epoch: 100  # total epochs (will be divided across stages in progressive mode)
   init_lr: 0.0005
   ckpt_freq_epoch: 20
-  patience: 3
+  patience: 5
   early_stopping_patience: 5
   
 # RQ model parameters
 rq_model:
   latent_shape: [496, 432, 64]
-  code_shape: [496, 432, 3]  # Last dimension = number of codebooks
-  codebook_size: 256  # Must be >= max(embedding_schedule)
+  code_shape: [496, 432, 10]  # Last dimension = number of codebooks
+  codebook_size: 64  # Must be >= max(embedding_schedule)
   decay: 0.99
   codebook_update_mode: 'LOSS'  # Training mode: 'LOSS' or 'EMA'
   
@@ -44,7 +44,7 @@ rq_model:
 # NOTE: codebook_weight is IGNORED (codebook_loss has no gradient in current implementation)
 loss_weights:
   det_weight: 10         # Detection task performance (normalized, range ~1-10)
-  vq_weight: 1.0          # Reconstruction quality / quantization error (range ~0.1-10)
+  vq_weight: 0.5          # Reconstruction quality / quantization error (range ~0.1-10)
   codebook_weight: 0.0    # NO EFFECT - kept for compatibility but not used
   # Recommended settings:
   # - Balanced: det_weight=1.0, vq_weight=1.0 (50/50)
@@ -71,4 +71,4 @@ save_stage_weights: True  # Also keep at top level for compatibility
   
 # Hardware
 hardware:
-  gpu: 3
+  gpu: 2

@@ -816,7 +816,11 @@ def full_kitti_evaluation(val_dataset, val_loader, headnet, tailnet, rq_bottlene
     return format_results
 
 def run_ema_warmup(loader, headnet, rq_bottleneck, epoch, ema_limit=None):
-    """Execute one epoch of EMA warmup with forward passes only."""
+    """Execute one epoch of EMA warmup with forward passes only.
+    
+    Args:
+        ema_limit: Limit from config (pretrain_ema_limit)
+    """
     rq_bottleneck.train()
     headnet.eval()
     
@@ -827,6 +831,8 @@ def run_ema_warmup(loader, headnet, rq_bottleneck, epoch, ema_limit=None):
         except (ValueError, TypeError):
             logging.warning(f"Invalid ema_limit value: {ema_limit}, ignoring it")
             ema_limit = None
+    
+    effective_limit = ema_limit
     
     batch_count = 0
     with torch.no_grad():
@@ -843,7 +849,7 @@ def run_ema_warmup(loader, headnet, rq_bottleneck, epoch, ema_limit=None):
             rq_bottleneck(pillar_features_hwc)
             
             batch_count += 1
-            if ema_limit is not None and batch_count >= ema_limit:
+            if effective_limit is not None and batch_count >= effective_limit:
                 logging.info(f"EMA warmup early stop at batch {batch_count}")
                 break
     

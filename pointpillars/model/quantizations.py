@@ -582,19 +582,19 @@ class RQBottleneck(nn.Module):
             if i == active_codebook_idx:
                 # Currently training codebook
                 cb.trainable = True
-                cb.set_active_n_embed(active_embed_size)
-                cb.set_frozen_n_embed(prev_embed_size)
+                cb.set_frozen_n_embed(prev_embed_size)      # ✅ 先設置 frozen
+                cb.set_active_n_embed(active_embed_size)    # ✅ 再設置 active
             elif i < active_codebook_idx:
                 # ✅ 選項 B：所有 codebook 使用相同的 embedding 數量
                 # 已訓練完成的 codebook 使用當前階段的 embedding 數量，全部凍結
                 cb.trainable = False
-                cb.set_active_n_embed(active_embed_size)    # 使用當前階段的 embedding 數量
-                cb.set_frozen_n_embed(active_embed_size)    # 全部凍結
+                cb.set_frozen_n_embed(active_embed_size)    # ✅ 先設置 frozen（全部凍結）
+                cb.set_active_n_embed(active_embed_size)    # ✅ 再設置 active（使用當前階段的 embedding 數量）
             else:
                 # Not yet trained codebooks: inactive
                 cb.trainable = False
-                cb.set_active_n_embed(0)
                 cb.set_frozen_n_embed(0)
+                cb.set_active_n_embed(0)
 
     def set_evaluation_stage(self, num_codebooks, num_embeddings):
         """
