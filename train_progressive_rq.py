@@ -399,14 +399,24 @@ def run_validation(rq_bottleneck, headnet, tailnet, val_dataloader, val_dataset,
 def validate_epoch(rq_bottleneck, headnet, tailnet, val_dataloader, args, device, CLASSES, 
                   epoch, warmup_epochs, config=None, stage_info=None, eval_save_dir=None):
     """
-    Run full KITTI evaluation using official do_eval
-    Always performs complete evaluation with all metrics
+    Run full KITTI evaluation using official do_eval.
     """
     print(f"\n{'='*80}")
     print(f"Running Full KITTI Evaluation - Epoch {epoch+1}")
     if stage_info:
         print(f"Codebook {stage_info.get('codebook_idx', '?')+1}, Embedding {stage_info.get('embed_size', '?')}")
     print(f"{'='*80}\n")
+    if stage_info and 'embed_size' in stage_info:
+        embed_size = stage_info['embed_size']
+        num_codebooks = stage_info.get('codebook_idx', 0) + 1
+        
+        print(f"⚙️  Configuring evaluation: {num_codebooks} codebook(s), {embed_size} embeddings each")
+        
+        for cb_i, cb in enumerate(rq_bottleneck.codebooks[:num_codebooks]):
+            cb.set_active_n_embed(embed_size)
+        
+        for cb_i in range(num_codebooks, len(rq_bottleneck.codebooks)):
+            rq_bottleneck.codebooks[cb_i].set_active_n_embed(0)
     
     # Get validation dataset and pcd_limit_range
     val_dataset = val_dataloader.dataset
@@ -434,7 +444,6 @@ def validate_epoch(rq_bottleneck, headnet, tailnet, val_dataloader, args, device
         print(f"{'='*80}\n")
     
     # Extract mAP from evaluation results
-    overall_mAP = 0.0
     bbox_3d_ap = None
     
     if eval_results and isinstance(eval_results, dict):
@@ -442,22 +451,28 @@ def validate_epoch(rq_bottleneck, headnet, tailnet, val_dataloader, args, device
             bbox_3d_data = eval_results['bbox_3d']
             if isinstance(bbox_3d_data, (list, tuple, np.ndarray)):
                 bbox_3d_ap = bbox_3d_data
-                if len(bbox_3d_ap) >= 3:
-                    overall_mAP = float(np.mean(bbox_3d_ap[:3]))
 
     # Log validation metrics to WandB if available
     try:
         import wandb
-        wandb.log({
-            'val/overall_mAP': float(overall_mAP),
+        log_dict = {
             'val/epoch': int(epoch)
-        })
+        }
+        
+        # Log individual difficulty levels if available
+        if bbox_3d_ap is not None and len(bbox_3d_ap) >= 3:
+            log_dict.update({
+                'val/bbox_3d_easy': float(bbox_3d_ap[0]),
+                'val/bbox_3d_moderate': float(bbox_3d_ap[1]),
+                'val/bbox_3d_hard': float(bbox_3d_ap[2])
+            })
+        
+        wandb.log(log_dict)
     except Exception:
         pass
     
     # Return metrics
     val_metrics = {
-        'overall_mAP': overall_mAP,
         'bbox_3d_ap': bbox_3d_ap,
         'eval_results': eval_results
     }
@@ -570,6 +585,11 @@ def train(
             loss.backward()
             torch.nn.utils.clip_grad_norm_(rq_bottleneck.parameters(), max_norm=1.0)
             optimizer.step()
+            
+            # ✅ Restore frozen embeddings (protection against weight decay)
+            for cb in rq_bottleneck.codebooks:
+                if cb.frozen_n_embed > 0:
+                    cb.restore_frozen_weights()
 
             n = len(batched_pts)
             sum_loss += loss.item() * n
@@ -624,19 +644,15 @@ def train(
             'train/vq_loss': float(avg_vq),
             'train/codebook_loss_monitor': float(avg_cb),
             'train/samples': int(total_samples),
-            'train/epoch': int(epoch)
+            'train/epoch': int(epoch),
+            'train/det_loss_scale': float(np.mean(det_loss_scale)) if det_loss_scale else 0.0,
+            'train/vq_loss_scale': float(np.mean(vq_loss_scale)) if det_loss_scale else 0.0,
+            'train/cb_loss_scale': float(np.mean(cb_loss_scale)) if det_loss_scale else 0.0,
+            'train/det_contribution_pct': float(det_pct),
+            'train/vq_contribution_pct': float(vq_pct)
         }
-        if det_loss_scale:
-            log_dict.update({
-                'train/det_loss_scale': float(np.mean(det_loss_scale)),
-                'train/vq_loss_scale': float(np.mean(vq_loss_scale)),
-                'train/cb_loss_scale': float(np.mean(cb_loss_scale)),
-                'train/det_contribution_pct': float(det_pct),
-                'train/vq_contribution_pct': float(vq_pct)
-            })
         wandb.log(log_dict)
     except Exception:
-        # wandb not installed or not initialized
         pass
 
     return avg_loss, avg_det, avg_vq, avg_cb
@@ -893,14 +909,10 @@ def setup_environment(exp_config, data_time_str):
     training_mode = exp_config.get("training", {}).get("mode", "train")
     codebook_update_mode = exp_config.get("rq_model", {}).get("codebook_update_mode", "LOSS")
 
-    results_dir = os.path.join("results", f"csv_{codebook_update_mode}_{data_time_str}")
     weights_dir = os.path.join("results", f"weights_{codebook_update_mode}_{data_time_str}")
-    os.makedirs(results_dir, exist_ok=True)
     os.makedirs(weights_dir, exist_ok=True)
-    csv_path = os.path.join(results_dir, f"progressive_results_{codebook_update_mode}_{data_time_str}.csv")
     
     logging.info(f"Weights directory: {weights_dir}")
-    logging.info(f"Results CSV: {csv_path}")
     
     # Initialize WandB if requested in config
     use_wandb = exp_config.get('logging', {}).get('use_wandb', False)
@@ -915,7 +927,7 @@ def setup_environment(exp_config, data_time_str):
         except Exception as e:
             logging.warning(f"WandB requested but failed to initialize: {e}")
 
-    return weights_dir, csv_path
+    return weights_dir
 
 def setup_models_and_data(exp_config):
     """Setup models, datasets, and loss functions."""
@@ -1068,11 +1080,7 @@ def run_evaluation_mode(exp_config, rq_bottleneck, headnet, tailnet, val_loader,
     logging.info("Evaluation Results Summary")
     logging.info("="*80)
     logging.info("\n" + df.to_string(index=False))
-    
-    # Save summary CSV
-    csv_path = os.path.join(eval_results_dir, f"evaluation_summary_{data_time_str}.csv")
-    df.to_csv(csv_path, index=False)
-    logging.info(f"\nSummary saved to: {csv_path}")
+    logging.info("")
     
     if use_full_kitti_eval:
         logging.info(f"\nFull KITTI evaluation results saved to: {eval_results_dir}")
@@ -1137,7 +1145,7 @@ def calculate_overall_map(val_metrics):
     raise ValueError(error_msg)
 
 def run_training_mode(exp_config, rq_bottleneck, headnet, tailnet, criterion, 
-                     train_loader, val_loader, val_dataset, weights_dir, csv_path, 
+                     train_loader, val_loader, val_dataset, weights_dir, 
                      args, device, CLASSES, pcd_limit_range):
     """Run progressive training mode."""
     logging.info("Starting Training")
@@ -1208,22 +1216,19 @@ def run_training_mode(exp_config, rq_bottleneck, headnet, tailnet, criterion,
                 logging.info(f"Phase 1: EMA Warmup ({warmup_epochs} epochs)")
                 rq_bottleneck.set_ema_mode(True)
                 
-                # 【關鍵修復】設置當前 codebook 為可訓練，以啟用 EMA 更新
-                # 所有 codebook 使用相同的 embedding 數量（當前階段的 embed_size）
-                
                 for cb_i, cb in enumerate(rq_bottleneck.codebooks):
                     if cb_i == codebook_idx:
-                        # 正在訓練的 codebook：必須設置為 trainable=True 才能啟用 EMA 更新
-                        cb.trainable = True  # ✅ 修復：啟用 trainable
-                        cb.set_frozen_n_embed(prev_embed_size)
-                        cb.set_active_n_embed(embed_size)
-                        logging.info(f"  Codebook {cb_i}: trainable=True, active=[{prev_embed_size}:{embed_size}]")
+                        # 正在訓練的 codebook：凍結前面訓練過的，只訓練新增的
+                        cb.trainable = True
+                        cb.set_frozen_n_embed(prev_embed_size)  # 凍結 [0:prev_embed_size]
+                        cb.set_active_n_embed(embed_size)       # 使用 [0:embed_size]
+                        logging.info(f"  Codebook {cb_i}: trainable=True, frozen=[0:{prev_embed_size}], active=[0:{embed_size}], training=[{prev_embed_size}:{embed_size}]")
                     elif cb_i < codebook_idx:
-                        # 已訓練完成的 codebook：使用當前階段的 embedding 數量
+                        # 已訓練完成的 codebook：使用當前階段的 embedding 數量，全部凍結
                         cb.trainable = False
-                        cb.set_frozen_n_embed(0)
-                        cb.set_active_n_embed(embed_size)  # 所有 codebook 使用相同數量
-                        logging.info(f"  Codebook {cb_i}: trainable=False (frozen), active=[0:{embed_size}]")
+                        cb.set_frozen_n_embed(embed_size)  # ✅ 凍結當前使用的 embeddings
+                        cb.set_active_n_embed(embed_size)  # ✅ 所有 codebook 使用相同的 embedding 數量
+                        logging.info(f"  Codebook {cb_i}: trainable=False (fully frozen), frozen=[0:{embed_size}], active=[0:{embed_size}]")
                     else:
                         # 未開始訓練的 codebook：不使用
                         cb.trainable = False
@@ -1233,16 +1238,6 @@ def run_training_mode(exp_config, rq_bottleneck, headnet, tailnet, criterion,
                 
                 for warmup_epoch in range(warmup_epochs):
                     run_ema_warmup(train_loader, headnet, rq_bottleneck, warmup_epoch, pretrain_ema_limit)
-                
-                # ✅ Warmup 後的驗證：配置所有已訓練的 codebook 使用相同的 embed_size
-                for cb_i, cb in enumerate(rq_bottleneck.codebooks):
-                    if cb_i <= codebook_idx:
-                        # 所有已訓練或正在訓練的 codebook：使用當前 embed_size
-                        cb.set_frozen_n_embed(0)
-                        cb.set_active_n_embed(embed_size)
-                    else:
-                        cb.set_frozen_n_embed(0)
-                        cb.set_active_n_embed(0)
                 
                 try:
                     val_metrics = validate_epoch(
@@ -1258,8 +1253,6 @@ def run_training_mode(exp_config, rq_bottleneck, headnet, tailnet, criterion,
             if training_mode == 'LOSS':
                 logging.info("Phase 2: Gradient Refinement")
                 
-                # 【重要】重新設定訓練階段，使該階段的 codebook 變為可訓練
-                # 凍結之前的 codebook，只訓練當前 codebook 的新 embedding 範圍
                 rq_bottleneck.set_training_stage(
                     active_codebook_idx=codebook_idx,
                     active_embed_size=embed_size,
@@ -1275,14 +1268,27 @@ def run_training_mode(exp_config, rq_bottleneck, headnet, tailnet, criterion,
                     logging.error("Failed to create optimizer. Exiting.")
                     return
                 
+                # ✅ 清除 frozen embeddings 的 optimizer state (momentum)
+                # Adam/AdamW optimizer 維護 exp_avg 和 exp_avg_sq，即使梯度為 0，
+                # 這些 momentum 仍會導致權重更新。因此必須清除 frozen 部分的 state。
+                logging.info("Clearing optimizer state for frozen embeddings...")
+                for cb_i, cb in enumerate(rq_bottleneck.codebooks):
+                    if cb.frozen_n_embed > 0 and cb.weight in optimizer.state:
+                        state = optimizer.state[cb.weight]
+                        if 'exp_avg' in state:
+                            state['exp_avg'][:cb.frozen_n_embed].zero_()
+                        if 'exp_avg_sq' in state:
+                            state['exp_avg_sq'][:cb.frozen_n_embed].zero_()
+                        logging.info(f"  Codebook {cb_i}: cleared optimizer state for frozen embeddings [0:{cb.frozen_n_embed}]")
+                
                 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                     optimizer, T_max=embedding_stage_epochs
                 )
 
             # Main training loop
             earlystopping.reset()
-            final_val_mAP = 0.0  # 记录这个阶段最后的 val mAP
-            final_val_metrics = None  # ✅ 儲存最後一次驗證結果
+            final_val_mAP = 0.0
+            final_val_metrics = None
             
             for epoch in range(embedding_stage_epochs):
                 if training_mode == 'EMA':
@@ -1298,20 +1304,6 @@ def run_training_mode(exp_config, rq_bottleneck, headnet, tailnet, criterion,
                 else:
                     train_loss, train_det, train_vq, train_cb = 0, 0, 0, 0
                 
-                # 【重要】在驗證前，配置所有 codebook 用於評估
-                # 所有已訓練和正在訓練的 codebook 使用相同的 embedding 數量
-                # 這樣可以公平比較不同階段的壓縮效果
-                
-                for cb_i, cb in enumerate(rq_bottleneck.codebooks):
-                    if cb_i <= codebook_idx:
-                        # 已訓練或正在訓練的 codebook：都使用當前階段的 embedding 數量
-                        cb.set_frozen_n_embed(0)
-                        cb.set_active_n_embed(embed_size)
-                    else:
-                        # 未開始訓練的 codebook：不使用
-                        cb.set_frozen_n_embed(0)
-                        cb.set_active_n_embed(0)
-                
                 # Validation with error handling
                 try:
                     val_metrics = validate_epoch(
@@ -1320,10 +1312,18 @@ def run_training_mode(exp_config, rq_bottleneck, headnet, tailnet, criterion,
                         stage_info={'codebook_idx': codebook_idx, 'embed_size': embed_size}
                     )
                     
-                    # Get mAP from validation
-                    overall_mAP = calculate_overall_map(val_metrics)
-                    final_val_metrics = val_metrics  # ✅ 儲存最新的驗證結果
-                    final_val_mAP = overall_mAP      # ✅ 儲存最新的 mAP
+                    # Use moderate difficulty mAP for early stopping (KITTI standard)
+                    bbox_3d_ap = val_metrics.get('bbox_3d_ap')
+                    if bbox_3d_ap is not None and len(bbox_3d_ap) >= 3:
+                        moderate_mAP = float(bbox_3d_ap[1])  # Index 1 = moderate
+                        overall_mAP = calculate_overall_map(val_metrics)  # For logging/summary
+                    else:
+                        logging.warning("No bbox_3d_ap found in validation metrics, using 0.0")
+                        moderate_mAP = 0.0
+                        overall_mAP = 0.0
+                    
+                    final_val_metrics = val_metrics
+                    final_val_mAP = overall_mAP
                     
                 except ValueError as e:
                     logging.error(f"Validation failed at epoch {epoch+1}: {str(e)}")
@@ -1332,47 +1332,48 @@ def run_training_mode(exp_config, rq_bottleneck, headnet, tailnet, criterion,
                     logging.error(f"Unexpected error during validation at epoch {epoch+1}: {str(e)}")
                     raise RuntimeError(f"Training stopped at epoch {epoch+1} due to unexpected error") from e
                 
-                logging.info(f"Epoch {epoch+1}/{embedding_stage_epochs}: Train Loss={train_loss:.4f}, mAP={overall_mAP:.4f}%")
+                logging.info(f"Epoch {epoch+1}/{embedding_stage_epochs}: Train Loss={train_loss:.4f}, mAP(overall)={overall_mAP:.4f}%, mAP(moderate)={moderate_mAP:.4f}%")
+                
+                # Log stage info to WandB
+                try:
+                    import wandb
+                    log_dict = {
+                        'stage/codebook_idx': codebook_idx,
+                        'stage/embed_size': embed_size,
+                        'stage/current_stage': current_stage,
+                        'stage/total_stages': total_stages
+                    }
+                    if scheduler:
+                        log_dict['learning_rate'] = scheduler.get_last_lr()[0]
+                    wandb.log(log_dict)
+                except Exception:
+                    pass
                 
                 if scheduler: scheduler.step()
                 
-                # Early stopping based on mAP (higher is better)
-                earlystopping(overall_mAP, rq_bottleneck)  # Pass mAP directly, not negated
+                # Early stopping based on moderate mAP (KITTI standard, higher is better)
+                earlystopping(moderate_mAP, rq_bottleneck)
                 if earlystopping.early_stop:
-                    logging.info(f"🛑 Early stopping triggered at epoch {epoch+1}")
+                    logging.info(f"🛑 Early stopping triggered at epoch {epoch+1} (moderate mAP: {moderate_mAP:.4f}%)")
                     break
             
-            # ========== 阶段结束：使用最後一次訓練的驗證結果 ==========
             logging.info(f"\n{'='*80}")
             logging.info(f"✅ Stage {current_stage}/{total_stages} Training Completed")
             logging.info(f"Codebook {codebook_idx+1}, Embedding [0:{embed_size}]")
             logging.info(f"{'='*80}\n")
             
-            # ✅ 檢查是否有驗證結果
             if final_val_metrics is None:
                 logging.warning("⚠️  No validation was performed during training!")
                 final_val_mAP = 0.0
             else:
                 logging.info(f"📊 Using last epoch's validation result: mAP = {final_val_mAP:.4f}%")
             
-            # ✅ 可選：保存詳細評估結果到專門的檔案
             stage_name = f"result_evaluate_cb{codebook_idx+1}_em{embed_size}.txt"
             stage_eval_path = os.path.join(eval_results_dir, stage_name)
             
             if final_val_metrics:
                 try:
                     logging.info(f"💾 Saving detailed evaluation to: {stage_name}")
-                    
-                    # 配置 codebook（與訓練時相同）
-                    for cb_i, cb in enumerate(rq_bottleneck.codebooks):
-                        if cb_i <= codebook_idx:
-                            cb.set_frozen_n_embed(0)
-                            cb.set_active_n_embed(embed_size)
-                        else:
-                            cb.set_frozen_n_embed(0)
-                            cb.set_active_n_embed(0)
-                    
-                    # 只執行一次評估並保存結果
                     detailed_val_metrics = validate_epoch(
                         rq_bottleneck, headnet, tailnet, val_loader, args, device, CLASSES,
                         epoch=0, warmup_epochs=0, config=exp_config, stage_info={},
@@ -1381,8 +1382,6 @@ def run_training_mode(exp_config, rq_bottleneck, headnet, tailnet, criterion,
                     logging.info(f"✅ Detailed results saved")
                 except Exception as e:
                     logging.warning(f"⚠️  Could not save detailed evaluation: {str(e)}")
-            
-            # 记录这个阶段的最终结果
             results.append({
                 "codebook_num": codebook_idx + 1, 
                 "embedding_dim": embed_size, 
@@ -1396,24 +1395,20 @@ def run_training_mode(exp_config, rq_bottleneck, headnet, tailnet, criterion,
             
             logging.info(f"Stage {current_stage}/{total_stages} completed\n")
     
-    logging.info("Training finished. Saving final results...")
+    logging.info("Training finished.")
     final_df = pd.DataFrame(results)
-    final_df.to_csv(csv_path, index=False)
-    logging.info(f"Training results saved: {csv_path}")
     
-    # 打印最终汇总表格 - 设置 pandas 显示选项以显示所有行和列
-    pd.set_option('display.max_rows', None)  # 显示所有行
-    pd.set_option('display.max_columns', None)  # 显示所有列
-    pd.set_option('display.width', None)  # 不限制宽度
-    pd.set_option('display.max_colwidth', None)  # 不限制列宽
+    pd.set_option('display.max_rows', None)
+    pd.set_option('display.max_columns', None)
+    pd.set_option('display.width', None)
+    pd.set_option('display.max_colwidth', None)
     
     logging.info("\n" + "="*80)
     logging.info("Final Training Results Summary")
     logging.info("="*80)
     logging.info("\n" + final_df.to_string(index=False))
-    logging.info("")  # 空行
+    logging.info("")
     
-    # 也打印统计信息
     logging.info("="*80)
     logging.info("Statistics:")
     logging.info(f"  Total stages trained: {len(final_df)}")
@@ -1436,12 +1431,10 @@ def Exp(exp_config, evaluate, data_time_str):
         run_evaluation_mode(exp_config, rq_bottleneck, headnet, tailnet, val_loader, val_dataset,
                           args, device, CLASSES, pcd_limit_range)
     else:
-        weights_dir, csv_path = setup_environment(exp_config, data_time_str)
-        run_training_mode(exp_config, rq_bottleneck, headnet, tailnet, criterion, 
-                          train_loader, val_loader, val_dataset, weights_dir, csv_path,
-                          args, device, CLASSES, pcd_limit_range)
-
-# ==============================================================================
+        weights_dir = setup_environment(exp_config, data_time_str)
+        run_training_mode(exp_config, rq_bottleneck, headnet, tailnet, criterion,
+                          train_loader, val_loader, val_dataset, weights_dir,
+                          args, device, CLASSES, pcd_limit_range)# ==============================================================================
 # >> Main Entry Point
 # ==============================================================================
 

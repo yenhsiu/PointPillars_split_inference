@@ -105,7 +105,7 @@ class VQEmbedding(nn.Embedding):
     def set_frozen_n_embed(self, n):
         """
         Sets the number of frozen (non-trainable) embeddings.
-        Saves a snapshot of cluster_size_ema for the frozen range.
+        Saves a snapshot of cluster_size_ema and weights for the frozen range.
         
         Args:
             n (int): Number of embeddings to freeze from index 0
@@ -117,6 +117,23 @@ class VQEmbedding(nn.Embedding):
             self.frozen_cluster_size_ema[:n] = self.cluster_size_ema[:n].clone()
         
         self.frozen_n_embed = n
+        
+        # Save frozen weights snapshot (for protection against weight decay)
+        if n > 0:
+            if not hasattr(self, '_frozen_weight_backup'):
+                self._frozen_weight_backup = torch.zeros_like(self.weight[:n])
+            elif self._frozen_weight_backup.shape[0] < n:
+                self._frozen_weight_backup = torch.zeros_like(self.weight[:n])
+            self._frozen_weight_backup[:n] = self.weight.data[:n].clone()
+    
+    def restore_frozen_weights(self):
+        """
+        Restores frozen embeddings from backup.
+        This protects against weight decay in optimizers like AdamW.
+        Should be called after optimizer.step() during gradient-based training.
+        """
+        if self.frozen_n_embed > 0 and hasattr(self, '_frozen_weight_backup'):
+            self.weight.data[:self.frozen_n_embed] = self._frozen_weight_backup[:self.frozen_n_embed]
 
     def set_active_n_embed(self, n):
         """
@@ -301,7 +318,7 @@ class VQEmbedding(nn.Embedding):
     def _update_embedding(self):
         """
         Update embedding weights from EMA buffers.
-        - Frozen range [0:frozen_n_embed]: Uses frozen_cluster_size_ema snapshot
+        - Frozen range [0:frozen_n_embed]: NOT UPDATED (completely frozen)
         - Trainable range [frozen_n_embed:active_n_embed]: Uses current cluster_size_ema
         """
         if not self._trainable:
@@ -313,20 +330,8 @@ class VQEmbedding(nn.Embedding):
         if n_active == 0:
             return
 
-        # Update frozen range with snapshot (keeps weight stable)
-        if frozen_end > 0:
-            frozen_cluster_size = self.frozen_cluster_size_ema[:frozen_end]
-            n_frozen_total = frozen_cluster_size.sum()
-            
-            if n_frozen_total > 0:
-                normalized_frozen = (
-                    n_frozen_total * (frozen_cluster_size + self.eps) / 
-                    (n_frozen_total + frozen_end * self.eps)
-                ).clamp(min=self.eps)
-                
-                self.weight.data[:frozen_end, :] = (
-                    self.embed_ema[:frozen_end] / normalized_frozen.unsqueeze(-1)
-                )
+        # ✅ 修復：Frozen range 完全不更新
+        # 不應該重新計算 frozen embeddings，即使使用 snapshot 也會導致數值變化
 
         # Update trainable range with current statistics
         if frozen_end < n_active:
@@ -363,20 +368,8 @@ class VQEmbedding(nn.Embedding):
         if n_embed == 0:
             return
         
-        # Sync frozen range with snapshot
-        if frozen_end > 0:
-            frozen_cluster_size = self.frozen_cluster_size_ema[:frozen_end]
-            n_frozen_total = frozen_cluster_size.sum()
-            
-            if n_frozen_total > 0:
-                normalized_frozen = (
-                    n_frozen_total * (frozen_cluster_size + self.eps) / 
-                    (n_frozen_total + frozen_end * self.eps)
-                ).clamp(min=self.eps)
-                
-                self.weight.data[:frozen_end, :] = (
-                    self.embed_ema[:frozen_end] / normalized_frozen.unsqueeze(-1)
-                )
+        # ✅ 修復：Frozen range 完全不更新
+        # 不應該重新計算 frozen embeddings
         
         # Sync trainable range with current statistics
         if frozen_end < n_embed:
@@ -592,10 +585,11 @@ class RQBottleneck(nn.Module):
                 cb.set_active_n_embed(active_embed_size)
                 cb.set_frozen_n_embed(prev_embed_size)
             elif i < active_codebook_idx:
-                # Previously trained codebooks: frozen and fully active
+                # ✅ 選項 B：所有 codebook 使用相同的 embedding 數量
+                # 已訓練完成的 codebook 使用當前階段的 embedding 數量，全部凍結
                 cb.trainable = False
-                cb.set_active_n_embed(active_embed_size)
-                cb.set_frozen_n_embed(full_embed_size)
+                cb.set_active_n_embed(active_embed_size)    # 使用當前階段的 embedding 數量
+                cb.set_frozen_n_embed(active_embed_size)    # 全部凍結
             else:
                 # Not yet trained codebooks: inactive
                 cb.trainable = False
